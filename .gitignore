@@ -1,0 +1,11 @@
+# Python cache folders (everywhere)
+__pycache__/
+
+# All PyTorch model files (everywhere)
+*.pt
+
+
+# Any folder named "plots" anywhere
+plots/
+**/plots/
+
