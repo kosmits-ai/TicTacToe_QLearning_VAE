@@ -1,16 +1,19 @@
 from typing import List, Tuple
 import random
+import pickle
+import os
+import copy
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
-import os
-from vae.model import VAE
 import torch.nn as nn
-from sklearn.model_selection import train_test_split
-import copy
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.decomposition import PCA
+from scipy.spatial.distance import cdist
+
+from vae.model import VAE
+
 Board = List[int]
 Turn = int
 
@@ -18,8 +21,18 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-PLOT_PATH = "./plots"
 
+PLOT_PATH = "./plots"
+os.makedirs(PLOT_PATH, exist_ok=True)
+
+Q_RANDOM_PATH = "Q_random.pkl"
+Q_MINIMAX_PATH = "Q_minimax.pkl"
+Q_SELF_PATH = "Q_self.pkl"
+
+TRAIN_STATES_SELF_PATH = "train_states_self.pt"
+VAL_STATES_SELF_PATH = "val_states_self.pt"
+TEST_STATES_SELF_PATH = "test_states_self.pt"
+VISITED_SELF_PATH = "visited_states_self.pt"
 
 
 class TicTacToe_N_K:
@@ -29,29 +42,31 @@ class TicTacToe_N_K:
 
     def reset(self) -> Board:
         return [0] * (self.n * self.n)
-    
+
     def encode_state(self, board: Board, turn: Turn) -> Tuple[int, ...]:
         return tuple(board + [turn])
-    
-    def get_legal_actions(self, board:Board) -> List[int]:
-        return [i for i , v in enumerate(board) if v == 0]
-    
+
+    def get_legal_actions(self, board: Board) -> List[int]:
+        return [i for i, v in enumerate(board) if v == 0]
+
     def step(self, board: Board, turn: Turn, action: int) -> Tuple[Board, Turn, float, bool]:
         if board[action] != 0:
             raise ValueError("Invalid action: Cell is already occupied.")
+
         next_board = board.copy()
         next_board[action] = turn
 
         winner = self.check_winner(next_board)
         if winner == turn:
-            return next_board, -turn, 1.0, True 
-        
+            return next_board, -turn, 1.0, True
+
         if all(cell != 0 for cell in next_board):
             return next_board, -turn, 0.0, True
-        
+
         return next_board, -turn, 0.0, False
-    
+
     def check_winner(self, board: Board) -> int:
+        # rows
         for r in range(self.n):
             for c in range(self.n - self.k + 1):
                 first = board[r * self.n + c]
@@ -59,14 +74,17 @@ class TicTacToe_N_K:
                     continue
                 if all(board[r * self.n + c + i] == first for i in range(self.k)):
                     return first
-        
+
+        # cols
         for c in range(self.n):
             for r in range(self.n - self.k + 1):
                 first = board[r * self.n + c]
                 if first == 0:
                     continue
                 if all(board[(r + i) * self.n + c] == first for i in range(self.k)):
-                    return first 
+                    return first
+
+        # main diagonals
         for r in range(self.n - self.k + 1):
             for c in range(self.n - self.k + 1):
                 first = board[r * self.n + c]
@@ -75,27 +93,48 @@ class TicTacToe_N_K:
                 if all(board[(r + t) * self.n + (c + t)] == first for t in range(self.k)):
                     return first
 
+        # anti-diagonals
         for r in range(self.n - self.k + 1):
             for c in range(self.k - 1, self.n):
-                first = board[r*self.n + c]
+                first = board[r * self.n + c]
                 if first == 0:
                     continue
-                if all(board[(r + t)*self.n + (c - t)] == first for t in range(self.k)):
+                if all(board[(r + t) * self.n + (c - t)] == first for t in range(self.k)):
                     return first
-        
+
         return 0
-    
+
     def print_board(self, board: Board):
-        symbols = {0: '-', 1: 'X', -1: 'O'}
+        symbols = {0: "-", 1: "X", -1: "O"}
         for i in range(self.n):
             row = [symbols[board[i * self.n + j]] for j in range(self.n)]
             print(" ".join(row))
 
 
-def update_Q_zero(Q : dict, state: Tuple[int,...], action: int, reward: float, next_state: Tuple[int, ...], legal_moves: List[int], legal_moves_next: List[int], alpha: float, gamma:float):
+def save_pickle(obj, path):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def update_Q_zero(
+    Q: dict,
+    state: Tuple[int, ...],
+    action: int,
+    reward: float,
+    next_state,
+    legal_moves: List[int],
+    legal_moves_next: List[int],
+    alpha: float,
+    gamma: float
+):
     if state not in Q:
         Q[state] = {a: 0.0 for a in legal_moves}
-    
+
     if legal_moves_next:
         if next_state not in Q:
             Q[next_state] = {a: 0.0 for a in legal_moves_next}
@@ -104,50 +143,23 @@ def update_Q_zero(Q : dict, state: Tuple[int,...], action: int, reward: float, n
         max_next_Q = 0.0
 
     Q[state][action] += alpha * (reward + gamma * max_next_Q - Q[state][action])
-
     return Q
-    
-def update_Q_random(Q : dict, state: Tuple[int,...], action: int, reward: float, next_state: Tuple[int, ...], legal_moves: List[int], legal_moves_next: List[int], alpha: float, gamma:float):
-    if state not in Q:
-        Q[state] = {a: random.uniform(-0.01,0.01) for a in legal_moves}
-    
-    if legal_moves_next:
-        if next_state not in Q:
-            Q[next_state] = {a: random.uniform(-0.01,0.01) for a in legal_moves_next}
-        max_next_Q = max(Q[next_state].values())
-    else:
-        max_next_Q = 0.0
-    
-    
-    Q[state][action] += alpha * (reward + gamma * max_next_Q - Q[state][action])
 
-    return Q
 
 def update_Q_minimax(
     Q: dict,
     state: Tuple[int, ...],
     action: int,
     reward: float,
-    next_state: Tuple[int, ...] | None,
+    next_state,
     legal_moves: List[int],
     legal_moves_next: List[int],
     alpha: float,
     gamma: float
 ):
-    """
-    Minimax-style Q update for 2-player zero-sum alternating-turn games.
-
-    Interpretation:
-      Q(s,a) = value for the player whose turn it is in state s.
-
-    Key difference vs standard Q-learning:
-      next_state belongs to the OPPONENT, so their best value should be subtracted:
-        target = r - gamma * max_a' Q(next_state, a')
-    """
     if state not in Q:
         Q[state] = {a: 0.0 for a in legal_moves}
 
-    # Terminal next_state: no future value
     if not legal_moves_next or next_state is None:
         max_next_Q = 0.0
     else:
@@ -155,16 +167,15 @@ def update_Q_minimax(
             Q[next_state] = {a: 0.0 for a in legal_moves_next}
         max_next_Q = max(Q[next_state].values())
 
-    target = reward - gamma * max_next_Q  # <-- adversarial backup (minus sign!)
+    target = reward - gamma * max_next_Q
     Q[state][action] += alpha * (target - Q[state][action])
     return Q
 
-def e_greedy_selection(Q: dict, state: Tuple[int,...], legal_moves: List[int], epsilon: float) -> int:
-    # exploration
+
+def e_greedy_selection(Q: dict, state: Tuple[int, ...], legal_moves: List[int], epsilon: float) -> int:
     if random.random() < epsilon:
         return random.choice(legal_moves)
 
-    # exploitation
     state_Q = Q.get(state, {})
     max_Q = max(state_Q.get(a, 0.0) for a in legal_moves)
     best_actions = [a for a in legal_moves if state_Q.get(a, 0.0) == max_Q]
@@ -176,114 +187,99 @@ def scheduled_epsilon(t: int, epsilon_start: float, epsilon_end: float, decay_st
         return epsilon_end
     return epsilon_start - (epsilon_start - epsilon_end) * (t / decay_steps)
 
-# OPTION A – SELF-PLAY (shared Q-table for both players)
-# ------------------------------------------------------
-# - The same Q-table is used for both X and O.
-# - The state always includes BOTH the board and the current turn:
-#       state = encode_state(board, turn)
-# - The agent chooses actions for whichever player’s turn it is.
-# - This allows symmetric learning and produces a general policy
-#   independent of playing first or second.
-#
-# OPTION B – FIXED OPPONENT (random or minimax)
-# ---------------------------------------------
-# - The Q-agent always plays as X, while O is external
-#   (random policy or minimax opponent).
-# - The state still includes turn for consistency with the project
-#   requirements, but only states with turn = +1 (X to act) are
-#   stored and updated in the Q-table.
-# - This simplifies learning because only the agent’s decisions
-#   are learned, while the opponent acts as part of the environment.
-# - step function returns reward for the player who just moved, so when O (opponent) moves and wins, the reward for X is -1, which we need to account for in the Q update to ensure X learns from losses as well as wins.
-# - In this design, reward is not equal to zero only in terminal states.
-# --------------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-def play_game_q_agent(game: TicTacToe_N_K, Q: dict, epsilon: float, games: int) -> None:
-    board = game.reset()
-    done = False
+
+def play_game_q_agent(game: TicTacToe_N_K, Q: dict, epsilon: float, games: int, states_visited: set) -> None:
     count_X_wins = 0
     count_draws = 0
     count_O_wins = 0
     loss_rates = []
     episodes = []
+
+    total_X_wins = 0
+    total_O_wins = 0
+    total_draws = 0
+
     for i in range(games):
-        board= game.reset()
+        board = game.reset()
         done = False
         start_turn = random.choice([1, -1])
 
         if start_turn == -1:
-            states_visited.add(game.encode_state(board, -1)) # Track the initial state
+            states_visited.add(game.encode_state(board, -1))
             legal_O = game.get_legal_actions(board)
             action_O = random.choice(legal_O)
             board, _, _, done = game.step(board, -1, action_O)
- 
-        epsilon = scheduled_epsilon(i, epsilon_start=1.0, epsilon_end=0.1, decay_steps=games//2)
+
+        epsilon_i = scheduled_epsilon(i, epsilon_start=1.0, epsilon_end=0.1, decay_steps=games // 2)
 
         while not done:
             state_X = game.encode_state(board, 1)
             legal_actions_X = game.get_legal_actions(board)
-            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon)
+            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon_i)
             board_after_X, _, reward_X, done = game.step(board, 1, action_X)
 
-            states_visited.add(state_X)  # Track unique states visited during training
-            
+            states_visited.add(state_X)
+
             if done:
-                states_visited.add(game.encode_state(board_after_X, -1))  # Track the final state where X wins
-                legal_moves_next = []
-                next_state = None
-                update_Q_zero(Q, state_X, action_X, reward_X, next_state, legal_actions_X, legal_moves_next, alpha=0.1, gamma=0.9)
+                states_visited.add(game.encode_state(board_after_X, -1))
+                update_Q_zero(Q, state_X, action_X, reward_X, None, legal_actions_X, [], alpha=0.1, gamma=0.9)
                 winner = game.check_winner(board_after_X)
-                if winner == 1.0:
+                if winner == 1:
                     count_X_wins += 1
+                    total_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
+                    total_O_wins += 1
                 else:
                     count_draws += 1
-                
+                    total_draws += 1
                 break
-            
-            states_visited.add(game.encode_state(board_after_X, -1)) # Track the state after X's move as well, even though it's O's turn, for analysis of visited states
+
+            states_visited.add(game.encode_state(board_after_X, -1))
             legal_O = game.get_legal_actions(board_after_X)
             action_O = random.choice(legal_O)
             board_after_O, _, reward_O, done = game.step(board_after_X, -1, action_O)
+
             if done:
-                states_visited.add(game.encode_state(board_after_O, 1))  # Track the final state where O wins
+                states_visited.add(game.encode_state(board_after_O, 1))
+
             if done and reward_O == 1.0:
-                # step function returns reward for the player who moves. Since O just moved and won, reward_O is +1 for O, which means it's -1 for X. 
-                # We add manually the reward for X after O's winning move to ensure the Q update for X reflects the loss.
-                r_for_X = -1.0  
+                r_for_X = -1.0
                 legal_next_for_X = []
                 count_O_wins += 1
+                total_O_wins += 1
             elif done:
                 r_for_X = 0.0
                 legal_next_for_X = []
                 count_draws += 1
+                total_draws += 1
             else:
-                    r_for_X = 0.0
-                    legal_next_for_X = game.get_legal_actions(board_after_O)
-            
+                r_for_X = 0.0
+                legal_next_for_X = game.get_legal_actions(board_after_O)
+
             next_state_X = game.encode_state(board_after_O, 1) if legal_next_for_X else None
-            
             update_Q_zero(Q, state_X, action_X, r_for_X, next_state_X, legal_actions_X, legal_next_for_X, alpha=0.1, gamma=0.9)
 
-            
             board = board_after_O
 
-        if (i+1) % 1000 == 0 and i > 0:
-            loss_rates.append(count_O_wins / (count_X_wins + count_O_wins + count_draws) if (count_X_wins + count_O_wins + count_draws) > 0 else 0)
-            episodes.append(i+1)
+        if (i + 1) % 1000 == 0 and i > 0:
+            total = count_X_wins + count_O_wins + count_draws
+            loss_rates.append(count_O_wins / total if total > 0 else 0)
+            episodes.append(i + 1)
             count_O_wins = 0
             count_X_wins = 0
             count_draws = 0
-        
 
-    
     plt.figure()
-    plt.plot(episodes, loss_rates, label='Loss Rate (O wins)')
-    plt.xlabel('Episodes')
-    plt.ylabel('Loss Rate')
-    plt.title('Loss Rate of Q-Learning Agent Over Time')
-    plt.savefig(PLOT_PATH + '/q_learning_random_loss_rate.png')
+    plt.plot(episodes, loss_rates, label="Loss Rate (O wins)")
+    plt.xlabel("Episodes")
+    plt.ylabel("Loss Rate")
+    plt.title("Loss Rate of Q-Learning Agent Over Time")
+    plt.savefig(PLOT_PATH + "/q_learning_random_loss_rate.png")
     plt.close()
+
+    print(f"After {games} games: X wins: {total_X_wins}, O wins: {total_O_wins}, Draws: {total_draws}")
+
 
 def evaluate_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None:
     count_X_wins = 0
@@ -301,23 +297,23 @@ def evaluate_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None:
             board, _, _, done = game.step(board, -1, action_O)
             if done:
                 winner = game.check_winner(board)
-                if winner == 1.0:
+                if winner == 1:
                     count_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
                 else:
                     count_draws += 1
                 continue
-            
+
         while not done:
             state_X = game.encode_state(board, 1)
             legal_actions_X = game.get_legal_actions(board)
-            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon=0.0)  # No exploration during evaluation
-            board_after_X, _, reward_X, done = game.step(board, 1, action_X)
+            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon=0.0)
+            board_after_X, _, _, done = game.step(board, 1, action_X)
 
             if done:
                 winner = game.check_winner(board_after_X)
-                if winner == 1.0:
+                if winner == 1:
                     count_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
@@ -327,7 +323,7 @@ def evaluate_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None:
 
             legal_O = game.get_legal_actions(board_after_X)
             action_O = random.choice(legal_O)
-            board_after_O, _, reward_O, done = game.step(board_after_X, -1, action_O)
+            board_after_O, _, _, done = game.step(board_after_X, -1, action_O)
 
             if done:
                 winner = game.check_winner(board_after_O)
@@ -338,11 +334,11 @@ def evaluate_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None:
                 else:
                     count_draws += 1
                 break
-            
+
             board = board_after_O
 
-    print(f"Evaluation after {games} episodes: X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
-# --------------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
+    print(f"Evaluation after {games} games: X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
+
 
 def terminal_score(game, board):
     winner = game.check_winner(board)
@@ -352,16 +348,17 @@ def terminal_score(game, board):
         return -1.0
     if not game.get_legal_actions(board):
         return 0.0
-    return None  # Game is not terminal
+    return None
+
 
 def alphabeta(game, board, turn, alpha, beta):
     score = terminal_score(game, board)
     if score is not None:
         return score
-    
+
     legal = game.get_legal_actions(board)
     if turn == -1:
-        value = -float('inf')
+        value = -float("inf")
         for action in legal:
             nb = board.copy()
             nb[action] = turn
@@ -370,9 +367,8 @@ def alphabeta(game, board, turn, alpha, beta):
             if alpha >= beta:
                 break
         return value
-    
     else:
-        value = float('inf')
+        value = float("inf")
         for action in legal:
             nb = board.copy()
             nb[action] = turn
@@ -382,16 +378,18 @@ def alphabeta(game, board, turn, alpha, beta):
                 break
         return value
 
+
 def minimax_move_alphabeta(game, board, turn=-1):
     legal = game.get_legal_actions(board)
-    best_score = float('-inf')
+    best_score = float("-inf")
     best_actions = []
-    alpha, beta = -float('inf'), float('inf')
+    alpha, beta = -float("inf"), float("inf")
 
     for action in legal:
         nb = board.copy()
-        nb[action] = turn   #player O plays
+        nb[action] = turn
         score = alphabeta(game, nb, -turn, alpha, beta)
+
         if score > best_score:
             best_score = score
             best_actions = [action]
@@ -404,90 +402,93 @@ def minimax_move_alphabeta(game, board, turn=-1):
     return random.choice(best_actions)
 
 
-def play_game_q_minimax_opponent(game: TicTacToe_N_K, Q: dict, epsilon: float, games: int) -> None:
-    board = game.reset()
-    done = False
+def play_game_q_minimax_opponent(game: TicTacToe_N_K, Q: dict, epsilon: float, games: int, states_visited: set) -> None:
     count_X_wins = 0
     count_draws = 0
     count_O_wins = 0
     loss_rates = []
     episodes = []
+
+    total_X_wins = 0
+    total_O_wins = 0
+    total_draws = 0
+
     for i in range(games):
-        board= game.reset()
+        board = game.reset()
         done = False
         start_turn = random.choice([1, -1])
 
         if start_turn == -1:
-            states_visited.add(game.encode_state(board, -1)) # Track the initial state
+            states_visited.add(game.encode_state(board, -1))
             action_O = minimax_move_alphabeta(game, board, turn=-1)
             board, _, _, done = game.step(board, -1, action_O)
-            
-    
-        epsilon = scheduled_epsilon(i, epsilon_start=1.0, epsilon_end=0.1, decay_steps=games//2)
+
+        epsilon_i = scheduled_epsilon(i, epsilon_start=1.0, epsilon_end=0.1, decay_steps=games // 2)
 
         while not done:
             state_X = game.encode_state(board, 1)
-            states_visited.add(state_X)  
+            states_visited.add(state_X)
             legal_actions_X = game.get_legal_actions(board)
-            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon)
+            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon_i)
             board_after_X, _, reward_X, done = game.step(board, 1, action_X)
 
             if done:
-                states_visited.add(game.encode_state(board_after_X, -1))  # Track the final state where X wins
-                legal_moves_next = []
-                next_state = None
-                update_Q_zero(Q, state_X, action_X, reward_X, next_state, legal_actions_X, legal_moves_next, alpha=0.1, gamma=0.9)
+                states_visited.add(game.encode_state(board_after_X, -1))
+                update_Q_zero(Q, state_X, action_X, reward_X, None, legal_actions_X, [], alpha=0.1, gamma=0.9)
                 winner = game.check_winner(board_after_X)
-                if winner == 1.0:
+                if winner == 1:
                     count_X_wins += 1
+                    total_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
+                    total_O_wins += 1
                 else:
                     count_draws += 1
-                
+                    total_draws += 1
                 break
-            
-            states_visited.add(game.encode_state(board_after_X, -1)) 
+
+            states_visited.add(game.encode_state(board_after_X, -1))
             action_O = minimax_move_alphabeta(game, board_after_X, turn=-1)
             board_after_O, _, reward_O, done = game.step(board_after_X, -1, action_O)
 
             if done:
-                states_visited.add(game.encode_state(board_after_O, 1))  # Track the final state where O wins
+                states_visited.add(game.encode_state(board_after_O, 1))
+
             if done and reward_O == 1.0:
-                #r_for_X is the reward for X after O's move, which is -1 if O wins, 0 if draw, and 0 if game continues
-                r_for_X = -1.0  
+                r_for_X = -1.0
                 legal_next_for_X = []
                 count_O_wins += 1
+                total_O_wins += 1
             elif done:
                 r_for_X = 0.0
                 legal_next_for_X = []
                 count_draws += 1
+                total_draws += 1
             else:
-                    r_for_X = 0.0
-                    legal_next_for_X = game.get_legal_actions(board_after_O)
-            
+                r_for_X = 0.0
+                legal_next_for_X = game.get_legal_actions(board_after_O)
+
             next_state_X = game.encode_state(board_after_O, 1) if legal_next_for_X else None
             update_Q_zero(Q, state_X, action_X, r_for_X, next_state_X, legal_actions_X, legal_next_for_X, alpha=0.1, gamma=0.9)
 
-            
             board = board_after_O
-        if (i+1) % 1000 == 0 and i > 0:
-            loss_rates.append(count_O_wins / (count_X_wins + count_O_wins + count_draws) if (count_X_wins + count_O_wins + count_draws) > 0 else 0)
-            episodes.append(i+1)
+
+        if (i + 1) % 1000 == 0 and i > 0:
+            total = count_X_wins + count_O_wins + count_draws
+            loss_rates.append(count_O_wins / total if total > 0 else 0)
+            episodes.append(i + 1)
             count_O_wins = 0
             count_X_wins = 0
             count_draws = 0
-        
 
-    print(f"After {games} games: X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
+    print(f"After {games} games: X wins: {total_X_wins}, O wins: {total_O_wins}, Draws: {total_draws}")
     plt.figure()
-    plt.plot(episodes, loss_rates, label='Loss Rate (O wins)')
-    plt.xlabel('Episodes')
-    plt.ylabel('Loss Rate')
-    plt.title('Loss Rate of Q-Learning Agent Over Time')
-    plt.savefig(PLOT_PATH + '/q_learning_minimax_loss_rate.png')
+    plt.plot(episodes, loss_rates, label="Loss Rate (O wins)")
+    plt.xlabel("Episodes")
+    plt.ylabel("Loss Rate")
+    plt.title("Loss Rate of Q-Learning Agent Over Time")
+    plt.savefig(PLOT_PATH + "/q_learning_minimax_loss_rate.png")
     plt.close()
-
 
 
 def evaluate_q_agent_minimax_opponent(game: TicTacToe_N_K, Q: dict, games: int) -> None:
@@ -505,23 +506,23 @@ def evaluate_q_agent_minimax_opponent(game: TicTacToe_N_K, Q: dict, games: int) 
             board, _, _, done = game.step(board, -1, action_O)
             if done:
                 winner = game.check_winner(board)
-                if winner == 1.0:
+                if winner == 1:
                     count_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
                 else:
                     count_draws += 1
                 continue
-            
+
         while not done:
             state_X = game.encode_state(board, 1)
             legal_actions_X = game.get_legal_actions(board)
-            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon=0.0)  # No exploration during evaluation
+            action_X = e_greedy_selection(Q, state_X, legal_actions_X, epsilon=0.0)
             board_after_X, _, _, done = game.step(board, 1, action_X)
 
             if done:
                 winner = game.check_winner(board_after_X)
-                if winner == 1.0:
+                if winner == 1:
                     count_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
@@ -532,7 +533,6 @@ def evaluate_q_agent_minimax_opponent(game: TicTacToe_N_K, Q: dict, games: int) 
             action_O = minimax_move_alphabeta(game, board_after_X, turn=-1)
             board_after_O, _, _, done = game.step(board_after_X, -1, action_O)
 
-
             if done:
                 winner = game.check_winner(board_after_O)
                 if winner == 1:
@@ -542,18 +542,20 @@ def evaluate_q_agent_minimax_opponent(game: TicTacToe_N_K, Q: dict, games: int) 
                 else:
                     count_draws += 1
                 break
-            
+
             board = board_after_O
 
-    print(f"Evaluation after {games} episodes: X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
+    print(f"Evaluation after {games} games: X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
 
 
-# --------------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-
-def play_game_q_self_play(game: TicTacToe_N_K, Q: dict, games: int) -> None:
+def play_game_q_self_play(game: TicTacToe_N_K, Q: dict, games: int, states_visited: set) -> None:
     count_X_wins = 0
     count_O_wins = 0
     count_draws = 0
+
+    total_X_wins = 0
+    total_O_wins = 0
+    total_draws = 0
 
     draw_rates = []
     episodes = []
@@ -561,15 +563,13 @@ def play_game_q_self_play(game: TicTacToe_N_K, Q: dict, games: int) -> None:
     for i in range(games):
         board = game.reset()
         done = False
-        turn = random.choice([1, -1])  # random start player
+        turn = random.choice([1, -1])
 
         epsilon_i = scheduled_epsilon(i, epsilon_start=1.0, epsilon_end=0.1, decay_steps=games // 2)
 
-        # Track the previous move so we can assign -1 to the loser when the opponent wins
         prev_state = None
         prev_action = None
         prev_legal = None
-        prev_turn = None  # whose move created prev_state/action
 
         while not done:
             state = game.encode_state(board, turn)
@@ -580,42 +580,39 @@ def play_game_q_self_play(game: TicTacToe_N_K, Q: dict, games: int) -> None:
             next_board, _, reward, done = game.step(board, turn, action)
 
             if done:
-                states_visited.add(game.encode_state(next_board, -turn))  # Track the final state as well
-                # Update winner's last move normally (reward from environment is +1 for winner, 0 for draw)
+                states_visited.add(game.encode_state(next_board, -turn))
                 update_Q_minimax(Q, state, action, reward, None, legal, [], alpha=0.1, gamma=0.9)
 
                 winner = game.check_winner(next_board)
 
-                
                 if winner != 0 and prev_state is not None and prev_action is not None:
-                    # The player who made the previous move is the loser (opponent just won)
-                    # Terminal update: no next_state, so legal_moves_next=[]
-                    update_Q_minimax(Q, prev_state, prev_action, reward=-1.0, next_state=None,
-                                     legal_moves=prev_legal, legal_moves_next=[],
-                                     alpha=0.1, gamma=0.9)
+                    update_Q_minimax(
+                        Q, prev_state, prev_action, reward=-1.0, next_state=None,
+                        legal_moves=prev_legal, legal_moves_next=[],
+                        alpha=0.1, gamma=0.9
+                    )
 
                 if winner == 1:
                     count_X_wins += 1
+                    total_X_wins += 1
                 elif winner == -1:
                     count_O_wins += 1
+                    total_O_wins += 1
                 else:
                     count_draws += 1
+                    total_draws += 1
                 break
 
-            # non-terminal: next player to act is -turn
             next_turn = -turn
             next_state = game.encode_state(next_board, next_turn)
             states_visited.add(next_state)
             legal_next = game.get_legal_actions(next_board)
 
-            # Update current move with minimax backup
             update_Q_minimax(Q, state, action, reward, next_state, legal, legal_next, alpha=0.1, gamma=0.9)
 
-            # Save this move as "previous" (for possible loss penalty on next terminal)
             prev_state = state
             prev_action = action
             prev_legal = legal
-            prev_turn = turn
 
             board = next_board
             turn = next_turn
@@ -623,20 +620,19 @@ def play_game_q_self_play(game: TicTacToe_N_K, Q: dict, games: int) -> None:
         if (i + 1) % 1000 == 0 and i > 0:
             total = count_X_wins + count_O_wins + count_draws
             draw_rates.append(count_draws / total if total > 0 else 0)
-            episodes.append(i+1)
+            episodes.append(i + 1)
             count_O_wins = 0
             count_X_wins = 0
             count_draws = 0
 
-    print(f"After {games} games (self-play): X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
+    print(f"After {games} games (self-play): X wins: {total_X_wins}, O wins: {total_O_wins}, Draws: {total_draws}")
     plt.figure()
-    plt.plot(episodes, draw_rates, label='Draw Rate')
-    plt.xlabel('Episodes')
-    plt.ylabel('Draw Rate')
-    plt.title('Self-Play Draw Rate Over Time')
-    plt.savefig(PLOT_PATH + '/self_play_draw_rate.png')
+    plt.plot(episodes, draw_rates, label="Draw Rate")
+    plt.xlabel("Episodes")
+    plt.ylabel("Draw Rate")
+    plt.title("Self-Play Draw Rate Over Time")
+    plt.savefig(PLOT_PATH + "/self_play_draw_rate.png")
     plt.close()
-
 
 
 def evaluate_self_play_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None:
@@ -652,7 +648,6 @@ def evaluate_self_play_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None
         while not done:
             state = game.encode_state(board, turn)
             legal = game.get_legal_actions(board)
-
             action = e_greedy_selection(Q, state, legal, epsilon=0.0)
             board, _, _, done = game.step(board, turn, action)
 
@@ -670,12 +665,12 @@ def evaluate_self_play_q_agent(game: TicTacToe_N_K, Q: dict, games: int) -> None
 
     print(f"Self-play eval ({games} games): X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
 
+
 def preprocess(states_tensor):
-    board_states = states_tensor[:, :-1] #Extract all columns expect of the last one
-    turns = states_tensor[:, -1]    #Extract last column
+    board_states = states_tensor[:, :-1]
+    turns = states_tensor[:, -1]
 
     board_mapped = board_states.clone()
-    #Transform {-1,1,0} encoding of cells to 0,1,2 to perform one hot encoding
     board_mapped[board_states == 1] = 0
     board_mapped[board_states == -1] = 1
     board_mapped[board_states == 0] = 2
@@ -683,18 +678,18 @@ def preprocess(states_tensor):
     board_onehot = torch.nn.functional.one_hot(board_mapped, num_classes=3).float()
     board_flat = board_onehot.view(board_onehot.size(0), -1)
 
-    turns_01 = (turns + 1) / 2  # Transform {-1,1} turn to {0,1} for consistency with one-hot encoding and to be used as an additional feature
-    X = torch.cat([board_flat, turns_01.unsqueeze(1)], dim=1) # final input: one-hot encoding of board (3 features per cell) + 1 feature for turn 
+    turns_01 = (turns + 1) / 2
+    X = torch.cat([board_flat, turns_01.unsqueeze(1)], dim=1)
 
-    return X, board_mapped, turns_01.unsqueeze(1)    
+    return X, board_mapped, turns_01.unsqueeze(1)
+
 
 def run_epoch(loader, training: bool, optimizer, beta):
-
     if training:
         vae.train()
     else:
         vae.eval()
-    
+
     total_loss = 0.0
     total_re = 0.0
     total_kl = 0.0
@@ -705,224 +700,870 @@ def run_epoch(loader, training: bool, optimizer, beta):
 
         if training:
             optimizer.zero_grad()
-        
+
         with torch.set_grad_enabled(training):
-            loss, re, kl = vae(x_enc, y_cells, y_turn, beta=beta, reduction='avg') #average loss, re, kl per batch 
+            loss, re, kl = vae(x_enc, y_cells, y_turn, beta=beta, reduction="avg")
             if training:
-                loss.backward() 
+                loss.backward()
                 optimizer.step()
-        
+
         bs = x_enc.size(0)
         total_loss += loss.item() * bs
         total_re += re.item() * bs
         total_kl += kl.item() * bs
         n_samples += bs
 
-        
+    return total_loss / n_samples, total_re / n_samples, total_kl / n_samples
 
-    return total_loss / n_samples, total_re / n_samples, total_kl / n_samples #return average loss, re, kl per state over the whole dataset
 
 def beta_schedule(epoch, warmup_epochs=10, max_beta=0.5):
-    return min(max_beta, max_beta * (epoch / warmup_epochs)) 
+    return min(max_beta, max_beta * (epoch / warmup_epochs))
 
 
-# -----------------------* -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-            # RUN A DEMO FOR OPPONENT RANDOM, AGENT LEARNING WITH Q-LEARNING UPDATE
-# -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-
-# ------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-            # SET PARAMETERS FOR TIC TAC TOE
-n = 3
-k = 3
-train_games = 50000
-test_games = 200
-# -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-
-if "train_states.pt" not in os.listdir() or "test_states.pt" not in os.listdir() or "val_states.pt" not in os.listdir():
-    game = TicTacToe_N_K(n, k)
-    states_visited = set()  # For tracking unique states visited during training
-
-    # #Play and evaluate Q-learning agent against random opponent
-    Q = {}
-    play_game_q_agent(game, Q, epsilon=1.0, games=train_games)
-    evaluate_q_agent(game, Q, games=test_games)
-
-    #Play and evaluate Q-learning agent against minimax opponent
-    Q={}
-    play_game_q_minimax_opponent(game, Q, epsilon=1.0, games=train_games)
-    evaluate_q_agent_minimax_opponent(game, Q, games=test_games)
-
-    #Play and evaluate Q-learning agent against itself (self-play)
-    Q = {}
-    play_game_q_self_play(game, Q, games=train_games)
-    evaluate_self_play_q_agent(game, Q, games=test_games)
-
-    print(f"Total unique states visited during training: {len(states_visited)}")
-
-    states_visited = list(states_visited)
-        
-    random.Random(42).shuffle(states_visited)  # Shuffle the states to ensure random order
-    n = len(states_visited)
-
-    train_ratio, val_ratio, test_ratio = 0.7, 0.15, 0.15
-    train_size = int(train_ratio * n)
-    val_size = int(val_ratio * n)
-    test_size = n - train_size - val_size
-
-    #Split dataset list to train, val, test
-    train_states = states_visited[:train_size]
-    test_states = states_visited[train_size:train_size + test_size]
-    val_states = states_visited[train_size + test_size:]
-
-    train_states_visited = np.array(train_states, dtype = np.int64)
-    test_states_visited = np.array(test_states, dtype = np.int64)
-    val_states_visited = np.array(val_states, dtype = np.int64)
-
-    train_states_tensor = torch.tensor(train_states_visited, dtype=torch.int64)
-    test_states_tensor = torch.tensor(test_states_visited, dtype=torch.int64)
-    val_states_tensor = torch.tensor(val_states_visited, dtype=torch.int64)
-
-    #Save tensors for future reference
-    torch.save(train_states_tensor, "train_states.pt")
-    torch.save(test_states_tensor, "test_states.pt")
-    torch.save(val_states_tensor, "val_states.pt")
-    print("States tensor saved to train_states.pt, test_states.pt, val_states.pt")
-
-else:
-    #Load pre-existed tensors
-    train_states_tensor = torch.load("train_states.pt")
-    test_states_tensor = torch.load("test_states.pt")
-    val_states_tensor = torch.load("val_states.pt")
-    print("States tensors loaded from train_states.pt, test_states.pt, val_states.pt")
+def reconstruct_batch(vae, x_enc):
+    vae.eval()
+    with torch.no_grad():
+        mu, logvar = vae.encoder.encode(x_enc)
+        z = mu
+        board_logits, turn_logit = vae.decoder.decode(z)
+        board_pred = board_logits.argmax(dim=-1)
+        turn_pred = (torch.sigmoid(turn_logit) > 0.5).float()
+    return board_pred, turn_pred
 
 
-X_train, y_cells_train, y_turn_train = preprocess(train_states_tensor)
-X_val,   y_cells_val,   y_turn_val   = preprocess(val_states_tensor)
-X_test,  y_cells_test,  y_turn_test  = preprocess(test_states_tensor)
+def evaluate_reconstruction(vae, loader):
+    vae.eval()
+    total_cells = 0
+    correct_cells = 0
+    total_turns = 0
+    correct_turns = 0
+
+    with torch.no_grad():
+        for x_enc, y_cells, y_turn in loader:
+            y_cells = y_cells.to(device)
+            y_turn = y_turn.to(device)
+            board_pred, turn_pred = reconstruct_batch(vae, x_enc.to(device))
+
+            total_cells += y_cells.numel()
+            correct_cells += (board_pred == y_cells).sum().item()
+            total_turns += y_turn.numel()
+            correct_turns += (turn_pred == y_turn).sum().item()
+
+    cell_acc = correct_cells / total_cells
+    turn_acc = correct_turns / total_turns
+    return cell_acc, turn_acc
 
 
-train_dataset = TensorDataset(X_train, y_cells_train, y_turn_train)
-val_dataset = TensorDataset(X_val, y_cells_val, y_turn_val)
-test_dataset = TensorDataset(X_test, y_cells_test, y_turn_test)
-
-#Load dataset in dataloader in order to pass data into batches.
-train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-# ------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-            #DEFINE VAE ARCHITECTURE
-# -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-
-input_dim = X_train.shape[1]
-latent_dim = 8 #will multiplied by 2
-hidden_dim = 64
-D = 9   #number of cells on the board for classic 3x3 Tic-Tac-Toe
-num_moves = 3 #empty, X, O
+def print_board_mapped(board):
+    symbols = {0: "X", 1: "O", 2: "."}
+    for i in range(3):
+        row = board[i * 3:(i + 1) * 3]
+        print(" ".join(symbols[int(c)] for c in row))
+    print()
 
 
-#Define structure of encoder, decoder of VAE
-encoder_net = nn.Sequential(
-    nn.Linear(input_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, latent_dim * 2)
-)
+def convert_mapped_to_original(board_mapped):
+    board_orig = []
+    for v in board_mapped:
+        if v == 0:
+            board_orig.append(1)
+        elif v == 1:
+            board_orig.append(-1)
+        else:
+            board_orig.append(0)
+    return board_orig
 
-decoder_net = nn.Sequential(
-    nn.Linear(latent_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, D*num_moves + 1)
-)
 
-vae = VAE(encoder_net, decoder_net, D = D, L = latent_dim, num_vals=num_moves)
+def visualize_latent_space(vae, loader):
+    vae.eval()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Move model to GPU if available for faster training
-vae.to(device)
+    all_mu = []
+    all_turns = []
+    all_num_filled = []
+    all_winners = []
 
-optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
+    game = TicTacToe_N_K(3, 3)
 
-# Define number of epochs and number of warm-up epochs. The warm-up epochs are those during which beta is gradually increased from 0 to 1, allowing the model to first focus on reconstruction before regularizing with KL divergence. After warm-up, beta remains at 1 for true ELBO optimization.
-epochs = 30
-warmup_epochs = 20
+    with torch.no_grad():
+        for x_enc, y_cells, y_turn in loader:
+            x_enc = x_enc.to(device)
 
-train_loss_list = []
-train_re_list = []
-train_kl_list = []
-epoch_list = []
-val_loss_list = []
-val_re_list = []
-val_kl_list = []
+            mu, _ = vae.encoder.encode(x_enc)
+            all_mu.append(mu.cpu())
+            all_turns.append(y_turn.cpu())
 
-best_state = None
-best_val_loss = float("inf")
-for epoch in range(epochs): #each epoch pass through the whole training dataset once
-    beta = beta_schedule(epoch, warmup_epochs, max_beta=1.0) # Linearly increase beta from 0 to max_beta over warmup_epochs, then keep it at max_beta
-    train_loss, train_re, train_kl = run_epoch(
-        train_dataloader, training=True, optimizer=optimizer, beta=beta
+            num_filled = (y_cells != 2).sum(dim=1)
+            all_num_filled.append(num_filled.cpu())
+
+            yc = y_cells.cpu().numpy()
+            winners_batch = []
+            for i in range(yc.shape[0]):
+                board_orig = convert_mapped_to_original(yc[i])
+                w = game.check_winner(board_orig)
+                if w == 1:
+                    winners_batch.append(1)
+                elif w == -1:
+                    winners_batch.append(2)
+                else:
+                    winners_batch.append(0)
+
+            all_winners.append(torch.tensor(winners_batch))
+
+    all_mu = torch.cat(all_mu).numpy()
+    all_turns = torch.cat(all_turns).numpy().flatten()
+    all_num_filled = torch.cat(all_num_filled).numpy()
+    all_winners = torch.cat(all_winners).numpy().flatten()
+
+    pca = PCA(n_components=2)
+    z_2d = pca.fit_transform(all_mu)
+
+    print("Explained variance ratio:", pca.explained_variance_ratio_)
+    unique, counts = np.unique(all_winners, return_counts=True)
+    print("Winner counts:", dict(zip(unique, counts)))
+
+    plt.figure(figsize=(6, 6))
+    for turn_value, color, label in [(0, "blue", "O turn"), (1, "red", "X turn")]:
+        mask = (all_turns == turn_value)
+        plt.scatter(z_2d[mask, 0], z_2d[mask, 1], c=color, label=label, alpha=0.6)
+    plt.legend()
+    plt.title("PCA of Latent Space Colored by Turn")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.savefig(PLOT_PATH + "/latent_space_turn.png")
+    plt.close()
+
+    plt.figure(figsize=(6, 6))
+    unique_progress = np.unique(all_num_filled)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(unique_progress)))
+    for prog_value, color in zip(unique_progress, colors):
+        mask = (all_num_filled == prog_value)
+        plt.scatter(z_2d[mask, 0], z_2d[mask, 1], color=color, label=f"{prog_value} filled", alpha=0.6)
+    plt.legend(title="Game Progress", bbox_to_anchor=(1.05, 1), loc="upper left")
+    plt.title("PCA of Latent Space Colored by Game Progress")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.tight_layout()
+    plt.savefig(PLOT_PATH + "/latent_space_progress.png")
+    plt.close()
+
+    plt.figure(figsize=(6, 6))
+    winner_labels = {
+        0: ("gray", "No Winner"),
+        1: ("green", "X Wins"),
+        2: ("orange", "O Wins")
+    }
+    for w, (color, label) in winner_labels.items():
+        mask = (all_winners == w)
+        if mask.sum() > 0:
+            plt.scatter(z_2d[mask, 0], z_2d[mask, 1], c=color, label=label, alpha=0.6)
+    plt.legend()
+    plt.title("PCA of Latent Space Colored by Winner")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.savefig(PLOT_PATH + "/latent_space_winner.png")
+    plt.close()
+
+
+def encode_single_state(board, turn, device):
+    b = torch.tensor(board, dtype=torch.int64, device=device).unsqueeze(0)
+
+    b_mapped = b.clone()
+    b_mapped[b == 1] = 0
+    b_mapped[b == -1] = 1
+    b_mapped[b == 0] = 2
+
+    b_oh = torch.nn.functional.one_hot(b_mapped, num_classes=3).float()
+    b_flat = b_oh.view(1, -1)
+
+    if turn in (-1, 1):
+        t01 = torch.tensor([[(turn + 1) / 2]], dtype=torch.float32, device=device)
+    elif turn in (0, 1):
+        t01 = torch.tensor([[turn]], dtype=torch.float32, device=device)
+    else:
+        raise ValueError(f"Unexpected turn value: {turn}")
+
+    x_enc = torch.cat([b_flat, t01], dim=1)
+    return x_enc
+
+
+def interpolate_between_boards(vae, board1, turn1, board2, turn2, steps=10):
+    vae.eval()
+    with torch.no_grad():
+        x1 = encode_single_state(board1, turn1, device)
+        x2 = encode_single_state(board2, turn2, device)
+
+        mu1, _ = vae.encoder.encode(x1)
+        mu2, _ = vae.encoder.encode(x2)
+
+        interpolated_boards = []
+        for alpha in np.linspace(0, 1, steps):
+            z_interp = (1 - alpha) * mu1 + alpha * mu2
+            board_logits, turn_logit = vae.decoder.decode(z_interp)
+            board_pred = board_logits.argmax(dim=-1).squeeze(0).cpu().numpy()
+            turn_pred = (torch.sigmoid(turn_logit) > 0.5).float().item()
+            interpolated_boards.append((board_pred, turn_pred))
+
+    return interpolated_boards
+
+
+def winner(board, player):
+    b = board.reshape(3, 3)
+    lines = []
+    lines.extend(b)
+    lines.extend(b.T)
+    lines.append([b[0, 0], b[1, 1], b[2, 2]])
+    lines.append([b[0, 2], b[1, 1], b[2, 0]])
+    return any(all(cell == player for cell in line) for line in lines)
+
+def validity_board_check(board, turn):
+    """
+    board: mapped board with values {0:X, 1:O, 2:empty}
+    turn:  mapped turn with values {1:X turn, 0:O turn}
+
+    Conventions:
+      board 0 = X, 1 = O, 2 = empty
+      turn  1 = X to play next, 0 = O to play next
+    """
+    board = np.asarray(board)
+
+    if not np.all(np.isin(board, [0, 1, 2])):
+        return False
+
+    if int(turn) not in [0, 1]:
+        return False
+
+    cells_X = int((board == 0).sum())
+    cells_O = int((board == 1).sum())
+    cells_empty = int((board == 2).sum())
+
+    if cells_X + cells_O + cells_empty != 9:
+        return False
+
+    # Standard tic-tac-toe reachability: X starts
+    if not (cells_X == cells_O or cells_X == cells_O + 1):
+        return False
+
+    X_win = winner(board, 0)
+    O_win = winner(board, 1)
+
+    if X_win and O_win:
+        return False
+
+    # Terminal winner parity
+    if X_win:
+        if cells_X != cells_O + 1:
+            return False
+        # after X just moved, next turn would be O
+        if turn != 0:
+            return False
+        return True
+
+    if O_win:
+        if cells_X != cells_O:
+            return False
+        # after O just moved, next turn would be X
+        if turn != 1:
+            return False
+        return True
+
+    # Non-terminal states: next player determined by move parity
+    if cells_X == cells_O:
+        # X to play
+        if turn != 1:
+            return False
+    elif cells_X == cells_O + 1:
+        # O to play
+        if turn != 0:
+            return False
+
+    return True
+
+def build_latent_dataset(vae, states_tensor):
+    vae.eval()
+    with torch.no_grad():
+        X, _, _ = preprocess(states_tensor)
+        X = X.to(device)
+        mu, _ = vae.encoder.encode(X)
+    return mu.cpu().numpy()
+
+
+def get_knn_indices(z_query, z_dataset, k=10):
+    distances = cdist(z_query.reshape(1, -1), z_dataset, metric="euclidean")[0]
+    k_eff = min(k, len(distances))
+    idx = np.argsort(distances)[:k_eff]
+    return idx, distances[idx]
+
+def estimate_Q_from_latent(z_query, z_dataset, states_dataset, Q, legal_moves, k=10):
+    """
+    Q2.4(e):
+      Q_tilde(x~, a) = sum_i w_i Q(x_i, a) / sum_i w_i
+      w_i = exp( - ||z-z_i||^2 / sigma^2 )
+    with sigma = median distance among the K nearest neighbors.
+
+    Only neighbors that actually have Q-values are used.
+    """
+    idx, distances = get_knn_indices(z_query, z_dataset, k=k)
+
+    if len(distances) == 0:
+        return {a: 0.0 for a in legal_moves}
+
+    sigma = np.median(distances)
+    if sigma <= 1e-8:
+        sigma = 1e-8
+
+    raw_weights = np.exp(-(distances ** 2) / (sigma ** 2))
+
+    Q_num = {a: 0.0 for a in legal_moves}
+    Q_den = {a: 0.0 for a in legal_moves}
+
+    for w, i in zip(raw_weights, idx):
+        neighbor_state = tuple(states_dataset[i])
+
+        if neighbor_state not in Q or len(Q[neighbor_state]) == 0:
+            continue
+
+        neighbor_Q = Q[neighbor_state]
+
+        for a in legal_moves:
+            Q_num[a] += w * neighbor_Q.get(a, 0.0)
+            Q_den[a] += w
+
+    Q_agg = {}
+    for a in legal_moves:
+        if Q_den[a] > 0:
+            Q_agg[a] = Q_num[a] / Q_den[a]
+        else:
+            Q_agg[a] = 0.0
+
+    return Q_agg
+
+def select_action_baseline(Q, state, legal_moves):
+    """
+    Baseline from Q2.4(e):
+    - if the state is unseen / has no Q-values -> uniform random legal move
+    - otherwise use tabular Q(state, action)
+    """
+    if state not in Q or len(Q[state]) == 0:
+        return random.choice(legal_moves)
+
+    state_Q = Q[state]
+    max_q = max(state_Q.get(a, 0.0) for a in legal_moves)
+    best_actions = [a for a in legal_moves if state_Q.get(a, 0.0) == max_q]
+    return random.choice(best_actions)
+
+
+def select_action_vae(vae, Q, board, turn, legal_moves, z_dataset, states_dataset, k=10):
+    x = encode_single_state(board, turn, device)
+
+    with torch.no_grad():
+        mu, _ = vae.encoder.encode(x)
+        z_query = mu.cpu().numpy()[0]
+
+    Q_est = estimate_Q_from_latent(
+        z_query=z_query,
+        z_dataset=z_dataset,
+        states_dataset=states_dataset,
+        Q=Q,
+        legal_moves=legal_moves,
+        k=k
     )
 
-    # evaluate with beta=1.0 (true ELBO scale)
-    val_loss, val_re, val_kl = run_epoch(val_dataloader, False, optimizer=None, beta=1.0)
+    max_q = max(Q_est[a] for a in legal_moves)
+    best_actions = [a for a in legal_moves if Q_est[a] == max_q]
+    return random.choice(best_actions)
+
+
+def is_safe_action(game, board, action, turn):
+    """
+    Safe iff after this action the opponent has NO immediate winning move.
+    """
+    next_board = board.copy()
+    next_board[action] = turn
+
+    if game.check_winner(next_board) == turn:
+        return True
+
+    opp = -turn
+    opp_legal = game.get_legal_actions(next_board)
+
+    for a in opp_legal:
+        tmp = next_board.copy()
+        tmp[a] = opp
+        if game.check_winner(tmp) == opp:
+            return False
+
+    return True
+
+
+def convert_turn_to_original(turn_sampled):
+    # mapped: 1 -> X turn, 0 -> O turn
+    return 1 if int(turn_sampled) == 1 else -1
+
+
+def sample_from_vae_prior(vae, num_samples=1000):
+    """
+    Q2.4(a): sample z ~ N(0, I) and decode.
+    Returns mapped boards {0,1,2} and mapped turns {0,1}.
+    """
+    vae.eval()
+    boards, turns = vae.sample(batch_size=num_samples, device=device)
+    return boards, turns
+
+
+def decode_and_filter_valid_states(boards, turns):
+    """
+    Q2.4(b)(c): keep only legal decoded states.
+    Also remove duplicates so counts refer to unique states.
+    """
+    valid_states = []
+    seen_valid = set()
+
+    total = len(boards)
+
+    for i in range(total):
+        board_sampled = boards[i].cpu().numpy()
+        turn_sampled = int(turns[i].item())
+
+        if not validity_board_check(board_sampled, turn_sampled):
+            continue
+
+        board_orig = convert_mapped_to_original(board_sampled)
+        turn_orig = convert_turn_to_original(turn_sampled)
+        state = tuple(board_orig + [turn_orig])
+
+        if state not in seen_valid:
+            seen_valid.add(state)
+            valid_states.append(state)
+
+    valid_count = len(valid_states)
+    acceptance_rate = valid_count / total if total > 0 else 0.0
+    return valid_states, valid_count, acceptance_rate
+
+def select_unseen_generated_states(valid_states, visited_states_set):
+    """
+    Q2.4(d):
+    unseen iff the exact encoded state never appeared in the visited-state table
+    of the same Q-learning regime being evaluated.
+    Also deduplicate unseen states explicitly.
+    """
+    unseen = []
+    seen_unseen = set()
+
+    for s in valid_states:
+        if s not in visited_states_set and s not in seen_unseen:
+            seen_unseen.add(s)
+            unseen.append(s)
+
+    return unseen
+def evaluate_generalization_2_4(game, vae, Q, z_dataset, states_dataset, generated_states, max_states=200, k=10):
+    safe_baseline = 0
+    safe_vae = 0
+    total = 0
+
+    for state in generated_states[:max_states]:
+        board = list(state[:-1])
+        turn = state[-1]
+
+        legal_moves = game.get_legal_actions(board)
+        if len(legal_moves) == 0:
+            continue
+
+        baseline_action = select_action_baseline(Q, state, legal_moves)
+
+        vae_action = select_action_vae(
+            vae=vae,
+            Q=Q,
+            board=board,
+            turn=turn,
+            legal_moves=legal_moves,
+            z_dataset=z_dataset,
+            states_dataset=states_dataset,
+            k=k
+        )
+
+        if is_safe_action(game, board, baseline_action, turn):
+            safe_baseline += 1
+
+        if is_safe_action(game, board, vae_action, turn):
+            safe_vae += 1
+
+        total += 1
+
+    if total == 0:
+        print("No valid unseen non-terminal generated states were available for evaluation.")
+        return {
+            "evaluated_unseen_states": 0,
+            "baseline_safe_rate": 0.0,
+            "vae_safe_rate": 0.0,
+            "evaluation_cap": max_states
+        }
+
+    baseline_rate = safe_baseline / total
+    vae_rate = safe_vae / total
+
+    print("\n--- Generalization Evaluation (Question 2.4) ---")
+    print(f"Evaluation cap (max unseen states considered): {max_states}")
+    print(f"Evaluated unseen non-terminal states: {total}")
+    print(f"Baseline safe-action rate: {baseline_rate:.4f}")
+    print(f"VAE latent-kNN safe-action rate: {vae_rate:.4f}")
+
+    return {
+        "evaluated_unseen_states": total,
+        "baseline_safe_rate": baseline_rate,
+        "vae_safe_rate": vae_rate,
+        "evaluation_cap": max_states
+    }
+
+def print_q24_summary(total_generated, valid_count, acceptance_rate, unseen_count, eval_results):
+    print("\n" + "=" * 68)
+    print("Question 2.4 Summary")
+    print("=" * 68)
+    print(f"{'Total generated samples':35s}: {total_generated}")
+    print(f"{'Valid decoded unique samples':35s}: {valid_count}")
+    print(f"{'Acceptance rate':35s}: {acceptance_rate:.4f}")
+    print(f"{'Unseen valid unique samples':35s}: {unseen_count}")
+    print(f"{'Evaluation cap':35s}: {eval_results['evaluation_cap']}")
+    print(f"{'Evaluated unseen non-terminal samples':35s}: {eval_results['evaluated_unseen_states']}")
+    print(f"{'Baseline safe-action rate':35s}: {eval_results['baseline_safe_rate']:.4f}")
+    print(f"{'VAE-based safe-action rate':35s}: {eval_results['vae_safe_rate']:.4f}")
+    print("=" * 68)
+
+    print("\nInterpretation:")
+    print(
+        "We generated candidate states from the VAE prior, retained unique valid decodings, "
+        "selected the subset of unique unseen states relative to the visited-state table, "
+        "and evaluated up to the specified cap of unseen non-terminal boards."
+    )
+    print(
+        "If the VAE-based agent achieves a higher safe-action rate on unseen boards, "
+        "this suggests that the latent representation captures useful structural "
+        "similarities between board states and transfers value information beyond the "
+        "exact states visited during tabular Q-learning."
+    )
+
+# -------------------- MAIN --------------------
+
+if __name__ == "__main__":
+    n = 3
+    k = 3
+    train_games = 1000
+    test_games = 100
+
+    game = TicTacToe_N_K(n, k)
+
+    need_self_state_files = (
+        not os.path.exists(TRAIN_STATES_SELF_PATH)
+        or not os.path.exists(VAL_STATES_SELF_PATH)
+        or not os.path.exists(TEST_STATES_SELF_PATH)
+        or not os.path.exists(VISITED_SELF_PATH)
+    )
+
+    need_qtables = (
+        not os.path.exists(Q_RANDOM_PATH)
+        or not os.path.exists(Q_MINIMAX_PATH)
+        or not os.path.exists(Q_SELF_PATH)
+    )
+
+    if need_self_state_files or need_qtables:
+        states_visited_random = set()
+        states_visited_minimax = set()
+        states_visited_self = set()
+
+        Q_random = {}
+        play_game_q_agent(game, Q_random, epsilon=1.0, games=train_games, states_visited=states_visited_random)
+        evaluate_q_agent(game, Q_random, games=test_games)
+
+        Q_minimax = {}
+        play_game_q_minimax_opponent(game, Q_minimax, epsilon=1.0, games=train_games, states_visited=states_visited_minimax)
+        evaluate_q_agent_minimax_opponent(game, Q_minimax, games=test_games)
+
+        Q_self = {}
+        play_game_q_self_play(game, Q_self, games=train_games, states_visited=states_visited_self)
+        evaluate_self_play_q_agent(game, Q_self, games=test_games)
+
+        save_pickle(Q_random, Q_RANDOM_PATH)
+        save_pickle(Q_minimax, Q_MINIMAX_PATH)
+        save_pickle(Q_self, Q_SELF_PATH)
+
+        print(f"Total unique self-play states visited during training: {len(states_visited_self)}")
+
+        states_visited_self_list = list(states_visited_self)
+        random.Random(42).shuffle(states_visited_self_list)
+        total_n = len(states_visited_self_list)
+        train_ratio, val_ratio, test_ratio = 0.7, 0.15, 0.15
+        train_size = int(train_ratio * total_n)
+        val_size = int(val_ratio * total_n)
+        test_size = total_n - train_size - val_size
+
+        train_states = states_visited_self_list[:train_size]
+        test_states = states_visited_self_list[train_size:train_size + test_size]
+        val_states = states_visited_self_list[train_size + test_size:]
+
+        train_states_tensor = torch.tensor(np.array(train_states, dtype=np.int64), dtype=torch.int64)
+        test_states_tensor = torch.tensor(np.array(test_states, dtype=np.int64), dtype=torch.int64)
+        val_states_tensor = torch.tensor(np.array(val_states, dtype=np.int64), dtype=torch.int64)
+        visited_self_tensor = torch.tensor(np.array(states_visited_self_list, dtype=np.int64), dtype=torch.int64)
+
+        torch.save(train_states_tensor, TRAIN_STATES_SELF_PATH)
+        torch.save(test_states_tensor, TEST_STATES_SELF_PATH)
+        torch.save(val_states_tensor, VAL_STATES_SELF_PATH)
+        torch.save(visited_self_tensor, VISITED_SELF_PATH)
+
+        print("Self-play states tensor saved.")
+
+    else:
+        train_states_tensor = torch.load(TRAIN_STATES_SELF_PATH)
+        test_states_tensor = torch.load(TEST_STATES_SELF_PATH)
+        val_states_tensor = torch.load(VAL_STATES_SELF_PATH)
+        visited_self_tensor = torch.load(VISITED_SELF_PATH)
+
+        Q_random = load_pickle(Q_RANDOM_PATH)
+        Q_minimax = load_pickle(Q_MINIMAX_PATH)
+        Q_self = load_pickle(Q_SELF_PATH)
+
+        print("Self-play state tensors loaded.")
+        print("Q-tables loaded from pickle files")
+
+    # ---------------- Dataset ----------------
+    X_train, y_cells_train, y_turn_train = preprocess(train_states_tensor)
+    X_val, y_cells_val, y_turn_val = preprocess(val_states_tensor)
+    X_test, y_cells_test, y_turn_test = preprocess(test_states_tensor)
+
+    train_dataset = TensorDataset(X_train, y_cells_train, y_turn_train)
+    val_dataset = TensorDataset(X_val, y_cells_val, y_turn_val)
+    test_dataset = TensorDataset(X_test, y_cells_test, y_turn_test)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+    # ---------------- VAE ----------------
+    input_dim = X_train.shape[1]
+    latent_dim = 8
+    hidden_dim = 64
+    D = 9
+    num_moves = 3
+
+    encoder_net = nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, latent_dim * 2)
+    )
+
+    decoder_net = nn.Sequential(
+        nn.Linear(latent_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, D * num_moves + 1)
+    )
+
+    vae = VAE(encoder_net, decoder_net, D=D, L=latent_dim, num_vals=num_moves)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vae.to(device)
+
+    optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
+
+    epochs = 50
+    warmup_epochs = 20
+
+    train_loss_list = []
+    train_re_list = []
+    train_kl_list = []
+    epoch_list = []
+    val_loss_list = []
+    val_re_list = []
+    val_kl_list = []
+
+    best_state = None
+    best_val_loss = float("inf")
+
+    for epoch in range(epochs):
+        beta = beta_schedule(epoch, warmup_epochs, max_beta=1.0)
+
+        train_loss, train_re, train_kl = run_epoch(
+            train_dataloader, training=True, optimizer=optimizer, beta=beta
+        )
+
+        val_loss, val_re, val_kl = run_epoch(
+            val_dataloader, training=False, optimizer=None, beta=1.0
+        )
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"beta={beta:.2f} | "
+            f"Train: Loss={train_loss:.4f}, RE={train_re:.4f}, KL={train_kl:.4f} | "
+            f"Val (beta=1): Loss={val_loss:.4f}, RE={val_re:.4f}, KL={val_kl:.4f}"
+        )
+
+        if epoch >= warmup_epochs and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(vae.state_dict())
+
+        if epoch % 2 == 0:
+            train_loss_list.append(train_loss)
+            train_re_list.append(train_re)
+            train_kl_list.append(train_kl)
+            epoch_list.append(epoch)
+            val_loss_list.append(val_loss)
+            val_re_list.append(val_re)
+            val_kl_list.append(val_kl)
+
+    plt.figure()
+    plt.plot(epoch_list, train_loss_list, "bo-", label="Train Loss")
+    plt.plot(epoch_list, val_loss_list, "co-", label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Total Loss Over Epochs")
+    plt.legend()
+    plt.savefig(PLOT_PATH + "/training_loss.png")
+    plt.close()
+
+    plt.figure()
+    plt.plot(epoch_list, train_re_list, "ro-", label="Train RE")
+    plt.plot(epoch_list, val_re_list, "mo-", label="Val RE")
+    plt.xlabel("Epoch")
+    plt.ylabel("Reconstruction_Error")
+    plt.title("Reconstruction Error Over Epochs")
+    plt.legend()
+    plt.savefig(PLOT_PATH + "/training_re.png")
+    plt.close()
+
+    plt.figure()
+    plt.plot(epoch_list, train_kl_list, "go-", label="Train KL")
+    plt.plot(epoch_list, val_kl_list, "yo-", label="Val KL")
+    plt.xlabel("Epoch")
+    plt.ylabel("KL_Divergence")
+    plt.title("KL Divergence Over Epochs")
+    plt.legend()
+    plt.savefig(PLOT_PATH + "/training_kl.png")
+    plt.close()
+
+    if best_state is not None:
+        vae.load_state_dict(best_state)
+        torch.save(best_state, "vae_best.pt")
+
+    test_loss, test_re, test_kl = run_epoch(test_dataloader, False, optimizer=None, beta=1.0)
+    print("TEST:", test_loss, test_re, test_kl)
+
+    # ---------------- Extra evaluation ----------------
+    vae = VAE(encoder_net=encoder_net, decoder_net=decoder_net, D=9, L=8, num_vals=3).to(device)
+    vae.load_state_dict(torch.load("vae_best.pt", map_location=device))
+    vae.eval()
+
+    board_pred, turn_pred = reconstruct_batch(vae, X_test.to(device))
+    cell_acc, turn_acc = evaluate_reconstruction(vae, test_dataloader)
+    print(f"Test Cell Accuracy: {cell_acc:.4f}, Test Turn Accuracy: {turn_acc:.4f}")
+
+    print("\n--- Sample Reconstructions from Test Set ---\n")
+    with torch.no_grad():
+        x_sample = X_test[:100].to(device)
+        y_cells_sample = y_cells_test[:100]
+        y_turn_sample = y_turn_test[:100]
+
+        board_pred, turn_pred = reconstruct_batch(vae, x_sample)
+        invalid_recon_count = 0
+
+        num_examples = min(100, X_test.shape[0])
+        for i in range(num_examples):
+            print(f"Example {i + 1}")
+            print("Original Board:")
+            print_board_mapped(y_cells_sample[i].cpu())
+
+            print("Reconstructed Board:")
+            print_board_mapped(board_pred[i].cpu())
+
+            print("Original Turn:", int(y_turn_sample[i].item()))
+            print("Predicted Turn:", int(turn_pred[i].item()))
+            print("-" * 40)
+
+            if not validity_board_check(board_pred[i].cpu().numpy(), int(turn_pred[i].item())):
+                print("Warning: Invalid reconstructed board state detected!")
+                invalid_recon_count += 1
+
+        print(f"Total invalid reconstructed board states in 100 examples from test set: {invalid_recon_count}")
+
+    visualize_latent_space(vae, test_dataloader)
+
+    board1 = [1, -1, 0, 0, 1, 0, 0, 0, 0]
+    turn1 = 1
+    board2 = [1, -1, 0, -1, 1, 0, 0, 0, 0]
+    turn2 = 0
+
+    interpolated = interpolate_between_boards(vae, board1, turn1, board2, turn2, steps=10)
+    invalid_interp = 0
+    for board, turn in interpolated:
+        if not validity_board_check(board, int(turn)):
+            invalid_interp += 1
+    print(f"Total invalid states during interpolation: {invalid_interp} out of {len(interpolated)}")
+
+    vae.eval()
+    samples = 100
+    boards, turns = vae.sample(batch_size=samples, device=device)
+
+    invalid_prior = 0
+    for i in range(samples):
+        board = boards[i].cpu().numpy()
+        turn = int(turns[i].item())
+        if not validity_board_check(board, turn):
+            invalid_prior += 1
+    print(f"Total invalid states in sampled prior: {invalid_prior} out of {samples}")
+    visited_states_set = set(map(tuple, visited_self_tensor.numpy()))
+
+    states_dataset_np = visited_self_tensor.numpy()
+
+    z_dataset = build_latent_dataset(vae, visited_self_tensor)
+
+    # latent kNN database uses all visited self-play states
     
 
-    print(
-    f"Epoch {epoch:03d} | "
-    f"beta={beta:.2f} | "
-    f"Train: Loss={train_loss:.4f}, RE={train_re:.4f}, KL={train_kl:.4f} | "
-    f"Val (beta=1): Loss={val_loss:.4f}, RE={val_re:.4f}, KL={val_kl:.4f}"
-)
+    # Q2.4(a): choose number of samples from prior
+    total_generated_samples = 1000
 
-    if epoch >= warmup_epochs and val_loss < best_val_loss:
-        best_val_loss = val_loss
-        best_state = copy.deepcopy(vae.state_dict()) # Save the best model state based on validation loss after warm-up epochs since val loss and train loss are decreasing and they are close.
+    # Q2.4(a)(b)
+    sampled_boards, sampled_turns = sample_from_vae_prior(
+        vae=vae,
+        num_samples=total_generated_samples
+    )
 
-    if epoch % 2 == 0:
-        train_loss_list.append(train_loss)
-        train_re_list.append(train_re)
-        train_kl_list.append(train_kl)
-        epoch_list.append(epoch)
-        val_loss_list.append(val_loss)
-        val_re_list.append(val_re)
-        val_kl_list.append(val_kl) # Store training and validation metrics every 2 epochs for plotting
+    # Q2.4(c)
+    valid_generated_states, valid_count, acceptance_rate = decode_and_filter_valid_states(
+        sampled_boards,
+        sampled_turns
+    )
 
-plt.figure()
-plt.plot(epoch_list, train_loss_list, 'bo-', label='Train Loss')
-plt.plot(epoch_list, val_loss_list, 'co-', label='Val Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Total Loss Over Epochs')
-plt.legend()
-plt.savefig(PLOT_PATH + '/training_loss.png')
-plt.close()
+    print("\n--- Question 2.4(a)(b)(c) ---")
+    print(f"Total generated samples from prior: {total_generated_samples}")
+    print(f"Valid decoded samples: {valid_count}")
+    print(f"Acceptance rate: {acceptance_rate:.4f}")
 
-plt.figure()
-plt.plot(epoch_list, train_re_list, 'ro-', label='Train RE')
-plt.plot(epoch_list, val_re_list, 'mo-', label='Val RE')
-plt.xlabel('Epoch')
-plt.ylabel('Reconstruction_Error')
-plt.title('Reconstruction Error Over Epochs')
-plt.legend()
-plt.savefig(PLOT_PATH + '/training_re.png')
-plt.close()
+    # Q2.4(d)
+    generated_unseen_states = select_unseen_generated_states(
+        valid_generated_states,
+        visited_states_set
+    )
+    print(f"Unseen valid generated states: {len(generated_unseen_states)}")
 
-plt.figure()
-plt.plot(epoch_list, train_kl_list, 'go-', label='Train KL')
-plt.plot(epoch_list, val_kl_list, 'yo-', label='Val KL')
-plt.xlabel('Epoch')
-plt.ylabel('KL_Divergence')
-plt.title('KL Divergence Over Epochs')
-plt.legend()
-plt.savefig(PLOT_PATH + '/training_kl.png')
-plt.close()
+    # Q2.4(e)
+    eval_results = evaluate_generalization_2_4(
+        game=game,
+        vae=vae,
+        Q=Q_self,
+        z_dataset=z_dataset,
+        states_dataset=states_dataset_np,
+        generated_states=generated_unseen_states,
+        max_states=200,
+        k=10
+    )
 
-if best_state is not None:
-    vae.load_state_dict(best_state)
-    torch.save(best_state, "vae_best.pt") # Save the best model state to a file for future reference
-test_loss, test_re, test_kl = run_epoch(test_dataloader, False, optimizer=None, beta=1.0) # Evaluate the best model on the test set using true ELBO scale (beta=1.0) to report final performance metrics on unseen states
-print("TEST:", test_loss, test_re, test_kl)
-
+    # Q2.4(f)
+    print_q24_summary(
+        total_generated=total_generated_samples,
+        valid_count=valid_count,
+        acceptance_rate=acceptance_rate,
+        unseen_count=len(generated_unseen_states),
+        eval_results=eval_results
+    )

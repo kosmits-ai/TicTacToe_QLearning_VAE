@@ -84,7 +84,7 @@ class Decoder(nn.Module):
         # # probs: (B, D, V)
         
         board_logits, turn_logit = self.decode(z)
-        weight_turn = 3.0 #weight for turn prediction in the loss, can be tuned as a hyperparameter
+        weight_turn = 1.0 #weight for turn prediction in the loss, can be tuned as a hyperparameter
         # # log prob per pixel after summing over classes -> (B, D)
         log_px_board = log_categorical_indices(x_idx, board_logits)
         
@@ -179,7 +179,7 @@ class VAE(nn.Module):
             device = next(self.parameters()).device
 
         # # sample z on device
-        z = self.prior.sample(batch_size, device=device, seed=42)  # # (B, L)
+        z = self.prior.sample(batch_size, device=device)  # # (B, L)
 
         # # sample x on device (returns integer-valued tensor)
         x_new, turn_new = self.decoder.sample(z)  # # (B, D)
