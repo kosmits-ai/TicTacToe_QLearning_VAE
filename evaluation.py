@@ -7,6 +7,8 @@ from vae.model import VAE
 from qlearning_tic_tac_toe import TicTacToe_N_K, preprocess, device, PLOT_PATH, encoder_net, decoder_net
 from torch.utils.data import DataLoader, TensorDataset
 import os
+import pickle
+import random
 
 if not os.path.exists(PLOT_PATH):
     os.makedirs(PLOT_PATH)
@@ -268,13 +270,133 @@ def validity_board_check(board, turn):
     if X_win and O_win:
         return False
 
-    # winner implies last mover has one extra move
-    if X_win and cells_X != cells_O + 1:
+    # winner played last → their piece count must be >= the other player's.
+    # Both cells_X == cells_O (other player started) and
+    # cells_X == cells_O + 1 (winner started) are valid terminal configurations.
+    # The only impossible case: winner has FEWER pieces than the other player.
+    if X_win and cells_X < cells_O:
         return False
-    if O_win and cells_O != cells_X + 1:
+    if O_win and cells_O < cells_X:
         return False
 
     return True
+
+
+# -------------------------------------------------------------------------
+# Q2.4 helpers
+# -------------------------------------------------------------------------
+
+def is_safe_action(game, board, turn, action):
+    """Returns True if playing 'action' leaves no immediate winning reply for the opponent."""
+    next_board, _, _, done = game.step(board.copy(), turn, action)
+    if done:
+        return True  # game ended — agent won or draw
+    opp_turn = -turn
+    for opp_action in game.get_legal_actions(next_board):
+        opp_board, _, _, opp_done = game.step(next_board.copy(), opp_turn, opp_action)
+        if opp_done and game.check_winner(opp_board) == opp_turn:
+            return False
+    return True
+
+
+def generalization_stress_test(vae, Q, visited_states_set, train_states_tensor, game, n_samples=1000, K=10):
+    """Q2.4 Generalization Stress Test: Baseline tabular Q vs VAE-based KNN agent on unseen boards."""
+    vae.eval()
+
+    # Precompute latent means for all KNN reference states
+    X_knn, _, _ = preprocess(train_states_tensor)
+    with torch.no_grad():
+        mu_knn, _ = vae.encoder.encode(X_knn.to(device))
+    mu_knn_np  = mu_knn.cpu().numpy()                                   # (N_train, L)
+    knn_states = [tuple(row.tolist()) for row in train_states_tensor]   # Q-table keys
+
+    # 2.4a: Sample z ~ N(0, I)
+    z = torch.randn(n_samples, vae.L, device=device)
+
+    # 2.4b: Decode → argmax per cell
+    with torch.no_grad():
+        board_logits, turn_logit = vae.decoder.decode(z)
+        boards_decoded = board_logits.argmax(dim=-1).cpu().numpy()                          # (N, 9) in {0,1,2}
+        turns_decoded  = (torch.sigmoid(turn_logit) > 0.5).float().cpu().numpy().squeeze(-1)  # (N,) in {0,1}
+
+    # 2.4c: Validity filtering — keep only non-terminal, legal boards
+    valid = [(boards_decoded[i], int(turns_decoded[i]))
+             for i in range(n_samples)
+             if validity_board_check(boards_decoded[i], int(turns_decoded[i]))
+             and not winner(boards_decoded[i], 0)
+             and not winner(boards_decoded[i], 1)]
+    n_valid = len(valid)
+    acceptance_rate = n_valid / n_samples
+
+    # 2.4d: Unseen filtering (state not in Q-learning visited-state set)
+    unseen = []
+    for board_mapped, turn_01 in valid:
+        board_orig = convert_mapped_to_original(board_mapped.tolist())
+        turn_orig  = 1 if turn_01 == 1 else -1
+        if game.encode_state(board_orig, turn_orig) not in visited_states_set:
+            unseen.append((board_orig, turn_orig))
+    n_unseen = len(unseen)
+
+    if n_unseen == 0:
+        print("No unseen boards found — try increasing n_samples.")
+        return
+
+    # 2.4e: Decision test
+    baseline_safe = 0
+    vae_safe      = 0
+
+    for board_orig, turn_orig in unseen:
+        legal = game.get_legal_actions(board_orig)
+        if not legal:
+            continue
+
+        # Baseline: tabular Q; fallback to random if state unseen
+        q_row = Q.get(game.encode_state(board_orig, turn_orig), {})
+        if q_row:
+            best_q          = max(q_row.get(a, 0.0) for a in legal)
+            baseline_action = random.choice([a for a in legal if q_row.get(a, 0.0) == best_q])
+        else:
+            baseline_action = random.choice(legal)
+
+        # VAE-based: weighted KNN in latent space
+        x_enc = encode_single_state(board_orig, turn_orig, device)
+        with torch.no_grad():
+            mu_q, _ = vae.encoder.encode(x_enc)
+        mu_q_np  = mu_q.cpu().numpy()
+        dists    = np.linalg.norm(mu_knn_np - mu_q_np, axis=1)
+        nn_idx   = np.argsort(dists)[:K]
+        nn_dists = dists[nn_idx]
+        sigma    = np.median(nn_dists) + 1e-8
+        weights  = np.exp(-nn_dists ** 2 / sigma ** 2)
+        weights /= weights.sum() + 1e-8
+
+        Q_tilde = {a: sum(weights[j] * Q.get(knn_states[nn_idx[j]], {}).get(a, 0.0)
+                          for j in range(K))
+                   for a in legal}
+        vae_action = max(Q_tilde, key=Q_tilde.get)
+
+        baseline_safe += is_safe_action(game, board_orig, turn_orig, baseline_action)
+        vae_safe      += is_safe_action(game, board_orig, turn_orig, vae_action)
+
+    baseline_rate = baseline_safe / n_unseen
+    vae_rate      = vae_safe      / n_unseen
+
+    # 2.4f: Report
+    sep = "=" * 55
+    print(f"\n{sep}")
+    print("Q2.4 Generalization Stress Test — Summary")
+    print(sep)
+    print(f"{'Total generated samples':<35} {n_samples}")
+    print(f"{'Valid samples':<35} {n_valid}  ({acceptance_rate:.1%})")
+    print(f"{'Unseen samples':<35} {n_unseen}")
+    print(f"{'Safe-action rate  Baseline':<35} {baseline_rate:.2%}")
+    print(f"{'Safe-action rate  VAE-based KNN':<35} {vae_rate:.2%}")
+    print(sep)
+    if vae_rate > baseline_rate:
+        print("=> VAE latent-space transfer improves generalisation on unseen states.")
+    else:
+        print("=> No clear generalisation gain for this sample (may vary with n_samples).")
+
 
 # ------------------------------------------------------------------------- * -----------------------------------------------------------------
 # Evaluation code to run after training is complete
@@ -347,6 +469,31 @@ for i, (board, turn) in enumerate(interpolated):
 
 print(f"Total invalid states during interpolation: {flag} out of {len(interpolated)}")
 
+# Plot interpolated boards (Q2.3c)
+_sym = {0: "X", 1: "O", 2: "."}
+_n_steps = len(interpolated)
+_cols = min(_n_steps, 5)
+_rows = (_n_steps + _cols - 1) // _cols
+fig, axes = plt.subplots(_rows, _cols, figsize=(3 * _cols, 4 * _rows), squeeze=False)
+axes = axes.flatten()
+for _idx, (_board_i, _turn_i) in enumerate(interpolated):
+    _ax = axes[_idx]
+    _grid = np.array(_board_i).reshape(3, 3)
+    _text = "\n".join(" ".join(_sym[int(_c)] for _c in _row) for _row in _grid)
+    _is_valid = validity_board_check(_board_i, _turn_i)
+    _t_val = _idx / max(_n_steps - 1, 1)
+    _ax.text(0.5, 0.5, _text, ha='center', va='center', fontsize=14, family='monospace')
+    _ax.set_title(f"t={_t_val:.2f}  {'valid' if _is_valid else 'INVALID'}",
+                  fontsize=9, color='black' if _is_valid else 'red')
+    _ax.axis('off')
+for _ax in axes[_n_steps:]:
+    _ax.axis('off')
+plt.suptitle("Latent Space Interpolation Between Two Boards")
+plt.tight_layout()
+plt.savefig(PLOT_PATH + '/interpolation_boards.png')
+plt.close()
+print("Interpolation boards plot saved to:", PLOT_PATH + '/interpolation_boards.png')
+
 # sampling from prio distribution
 
 vae.eval()
@@ -369,3 +516,40 @@ for i in range(samples):
         flag += 1
 
 print(f"Total invalid states in sampled prior: {flag} out of {samples}")
+
+# Plot sampled boards from prior (Q2.3d)
+_sym = {0: "X", 1: "O", 2: "."}
+_n_show = min(20, samples)
+fig, axes = plt.subplots(4, 5, figsize=(12, 10), squeeze=False)
+axes = axes.flatten()
+for _i in range(_n_show):
+    _board_i  = boards[_i].cpu().numpy()
+    _turn_i   = int(turns[_i].item())
+    _grid     = np.array(_board_i).reshape(3, 3)
+    _text     = "\n".join(" ".join(_sym[int(_c)] for _c in _row) for _row in _grid)
+    _is_valid = validity_board_check(_board_i, _turn_i)
+    axes[_i].text(0.5, 0.5, _text, ha='center', va='center',
+                  fontsize=13, family='monospace')
+    axes[_i].set_title('valid' if _is_valid else 'INVALID', fontsize=8,
+                       color='green' if _is_valid else 'red')
+    axes[_i].axis('off')
+for _ax in axes[_n_show:]:
+    _ax.axis('off')
+plt.suptitle("Boards Sampled from the Prior  p(z) = N(0, I)")
+plt.tight_layout()
+plt.savefig(PLOT_PATH + '/sampled_boards.png')
+plt.close()
+print("Sampled boards plot saved to:", PLOT_PATH + '/sampled_boards.png')
+
+# -------------------------------------------------------------------------
+# Q2.4 Generalization Stress Test
+# -------------------------------------------------------------------------
+if os.path.exists("Q_self.pkl") and os.path.exists("visited_states_all.pt"):
+    with open("Q_self.pkl", "rb") as _f:
+        Q_self_loaded = pickle.load(_f)
+    visited_tensor = torch.load("visited_states_all.pt", map_location="cpu")
+    visited_set    = {tuple(row.tolist()) for row in visited_tensor}
+    stress_game = TicTacToe_N_K(3, 3)
+    generalization_stress_test(vae, Q_self_loaded, visited_set, train_state_tensor, stress_game, n_samples=1000, K=10)
+else:
+    print("Q_self.pkl or visited_states_all.pt not found — re-run qlearning_tic_tac_toe.py first.")

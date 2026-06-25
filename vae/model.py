@@ -179,7 +179,7 @@ class VAE(nn.Module):
             device = next(self.parameters()).device
 
         # # sample z on device
-        z = self.prior.sample(batch_size, device=device, seed=42)  # # (B, L)
+        z = self.prior.sample(batch_size, device=device)  # # (B, L)
 
         # # sample x on device (returns integer-valued tensor)
         x_new, turn_new = self.decoder.sample(z)  # # (B, D)

@@ -1,5 +1,6 @@
 from typing import List, Tuple
 import random
+import pickle
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -477,7 +478,8 @@ def play_game_q_minimax_opponent(game: TicTacToe_N_K, Q: dict, epsilon: float, g
             count_O_wins = 0
             count_X_wins = 0
             count_draws = 0
-        
+        if (i+1) % 5000 == 0:
+            print(f"  [Minimax] Episode {i+1}/{games}")
 
     print(f"After {games} games: X wins: {count_X_wins}, O wins: {count_O_wins}, Draws: {count_draws}")
     plt.figure()
@@ -726,6 +728,80 @@ def beta_schedule(epoch, warmup_epochs=10, max_beta=0.5):
     return min(max_beta, max_beta * (epoch / warmup_epochs)) 
 
 
+# =============================================================================
+# Q1.6 – Combining Knowledge from Multiple Q-Tables
+# =============================================================================
+
+def merge_q_tables_avg(q_list: list) -> dict:
+    """
+    Merge multiple Q-tables by averaging Q-values.
+
+    For each (state, action) pair present in any of the source tables the
+    merged value is the arithmetic mean of all available estimates.  States
+    that appear in only a subset of the tables are still included; the average
+    is taken over the tables that actually contain that (state, action) pair.
+    """
+    merged: dict = {}
+    count:  dict = {}
+    for Q in q_list:
+        for state, actions in Q.items():
+            if state not in merged:
+                merged[state] = {}
+                count[state]  = {}
+            for action, value in actions.items():
+                merged[state][action] = merged[state].get(action, 0.0) + value
+                count[state][action]  = count[state].get(action, 0)   + 1
+    for state in merged:
+        for action in merged[state]:
+            merged[state][action] /= count[state][action]
+    return merged
+
+
+def merge_q_tables_max(q_list: list) -> dict:
+    """
+    Merge multiple Q-tables by taking the element-wise maximum Q-value.
+
+    Retains the most optimistic estimate seen across all training regimes for
+    each (state, action) pair.  This can be useful when one of the source
+    tables has been trained against a strong opponent and has learned high-
+    confidence values for certain positions that the others have not converged
+    on yet.
+    """
+    merged: dict = {}
+    for Q in q_list:
+        for state, actions in Q.items():
+            if state not in merged:
+                merged[state] = {}
+            for action, value in actions.items():
+                if action not in merged[state] or value > merged[state][action]:
+                    merged[state][action] = value
+    return merged
+
+
+def fine_tune_merged_q(game: TicTacToe_N_K, Q_merged: dict,
+                       fine_tune_games: int = 15000) -> dict:
+    """
+    Refine a merged Q-table via additional self-play training.
+
+    Self-play exposes the merged table to high-quality game sequences and
+    helps resolve value inconsistencies introduced by merging tables that
+    were trained against different opponent types.  The agent plays both
+    sides using the same Q-table (with a low exploration rate), so strong
+    positions from any source table are reinforced while contradictions are
+    gradually smoothed out.
+
+    For full multi-opponent rotation one could additionally call
+    play_game_q_agent and play_game_q_minimax_opponent with a low epsilon
+    on separate episode segments.  Here we use self-play only, which provides
+    the strongest opponent and most efficiently reduces sub-optimality in the
+    merged estimates.
+    """
+    global states_visited
+    states_visited = set()       # reset; fine-tuning is not used for dataset collection
+    play_game_q_self_play(game, Q_merged, games=fine_tune_games)
+    return Q_merged
+
+
 # -----------------------* -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
             # RUN A DEMO FOR OPPONENT RANDOM, AGENT LEARNING WITH Q-LEARNING UPDATE
 # -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
@@ -738,7 +814,7 @@ train_games = 50000
 test_games = 200
 # -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
 
-if "train_states.pt" not in os.listdir() or "test_states.pt" not in os.listdir() or "val_states.pt" not in os.listdir():
+if "train_states.pt" not in os.listdir() or "test_states.pt" not in os.listdir() or "val_states.pt" not in os.listdir() or not os.path.exists("Q_self.pkl"):
     game = TicTacToe_N_K(n, k)
     states_visited = set()  # For tracking unique states visited during training
 
@@ -753,11 +829,17 @@ if "train_states.pt" not in os.listdir() or "test_states.pt" not in os.listdir()
     evaluate_q_agent_minimax_opponent(game, Q, games=test_games)
 
     #Play and evaluate Q-learning agent against itself (self-play)
-    Q = {}
-    play_game_q_self_play(game, Q, games=train_games)
-    evaluate_self_play_q_agent(game, Q, games=test_games)
+    Q_self = {}
+    play_game_q_self_play(game, Q_self, games=train_games)
+    evaluate_self_play_q_agent(game, Q_self, games=test_games)
 
     print(f"Total unique states visited during training: {len(states_visited)}")
+
+    with open("Q_self.pkl", "wb") as _f:
+        pickle.dump(Q_self, _f)
+    _visited_np = np.array(list(states_visited), dtype=np.int64)
+    torch.save(torch.tensor(_visited_np, dtype=torch.int64), "visited_states_all.pt")
+    print("Q_self.pkl and visited_states_all.pt saved.")
 
     states_visited = list(states_visited)
         
@@ -794,6 +876,103 @@ else:
     test_states_tensor = torch.load("test_states.pt")
     val_states_tensor = torch.load("val_states.pt")
     print("States tensors loaded from train_states.pt, test_states.pt, val_states.pt")
+
+
+# =============================================================================
+# Q1.6 – Train / load per-regime Q-tables and combine them
+# =============================================================================
+if not os.path.exists("Q_random.pkl") or not os.path.exists("Q_minimax.pkl"):
+    _board_n16, _board_k16 = 3, 3
+    _game16 = TicTacToe_N_K(_board_n16, _board_k16)
+    states_visited = set()
+
+    Q_random = {}
+    print("Q1.6: Training Q_random (vs random opponent) ...")
+    play_game_q_agent(_game16, Q_random, epsilon=1.0, games=train_games)
+    with open("Q_random.pkl", "wb") as _f16:
+        pickle.dump(Q_random, _f16)
+
+    Q_minimax_16 = {}
+    print("Q1.6: Training Q_minimax (vs minimax opponent) ...")
+    play_game_q_minimax_opponent(_game16, Q_minimax_16, epsilon=1.0, games=train_games)
+    with open("Q_minimax.pkl", "wb") as _f16:
+        pickle.dump(Q_minimax_16, _f16)
+
+    print("Q_random.pkl and Q_minimax.pkl saved.")
+else:
+    with open("Q_random.pkl", "rb") as _f16:
+        Q_random = pickle.load(_f16)
+    with open("Q_minimax.pkl", "rb") as _f16:
+        Q_minimax_16 = pickle.load(_f16)
+    print("Q_random.pkl and Q_minimax.pkl loaded.")
+
+with open("Q_self.pkl", "rb") as _f16:
+    Q_self_16 = pickle.load(_f16)
+
+# Q1.6b – Merge Q-tables (two strategies)
+Q_merged_avg = merge_q_tables_avg([Q_random, Q_minimax_16, Q_self_16])
+Q_merged_max = merge_q_tables_max([Q_random, Q_minimax_16, Q_self_16])
+print(f"Q1.6 Merged (avg): {len(Q_merged_avg)} states | "
+      f"Merged (max): {len(Q_merged_max)} states")
+
+# Q1.6c – Fine-tune the average-merged table via self-play
+if not os.path.exists("Q_merged_finetuned.pkl"):
+    _board_n16, _board_k16 = 3, 3
+    _game16 = TicTacToe_N_K(_board_n16, _board_k16)
+    Q_merged_finetuned = fine_tune_merged_q(_game16, copy.deepcopy(Q_merged_avg),
+                                            fine_tune_games=15000)
+    with open("Q_merged_finetuned.pkl", "wb") as _f16:
+        pickle.dump(Q_merged_finetuned, _f16)
+    print("Q_merged_finetuned.pkl saved.")
+else:
+    with open("Q_merged_finetuned.pkl", "rb") as _f16:
+        Q_merged_finetuned = pickle.load(_f16)
+    print("Q_merged_finetuned.pkl loaded.")
+
+# Evaluate all three merged variants against a random opponent
+_eval_game16 = TicTacToe_N_K(3, 3)
+print("\nQ1.6 Evaluation vs random opponent:")
+print("  Merged-Avg :")
+evaluate_q_agent(_eval_game16, Q_merged_avg, games=test_games)
+print("  Merged-Max :")
+evaluate_q_agent(_eval_game16, Q_merged_max, games=test_games)
+print("  Fine-tuned :")
+evaluate_q_agent(_eval_game16, Q_merged_finetuned, games=test_games)
+
+# =============================================================================
+# Generate self-play-only state tensors (train / val / test splits)
+# =============================================================================
+if ("train_states_self.pt"   not in os.listdir()
+        or "val_states_self.pt"   not in os.listdir()
+        or "test_states_self.pt"  not in os.listdir()
+        or "visited_states_self.pt" not in os.listdir()):
+    print("Generating self-play-only state tensors ...")
+    _board_nsp, _board_ksp = 3, 3
+    _game_sp = TicTacToe_N_K(_board_nsp, _board_ksp)
+    states_visited = set()          # reset → captures self-play states only
+    _Q_sp = {}
+    play_game_q_self_play(_game_sp, _Q_sp, games=train_games)
+
+    _visited_sp_np = np.array(list(states_visited), dtype=np.int64)
+    torch.save(torch.tensor(_visited_sp_np, dtype=torch.int64), "visited_states_self.pt")
+
+    _sp_list = list(states_visited)
+    random.Random(42).shuffle(_sp_list)
+    _n_sp  = len(_sp_list)
+    _tr_sp = int(0.70 * _n_sp)
+    _vl_sp = int(0.15 * _n_sp)
+    _te_sp = _n_sp - _tr_sp - _vl_sp
+
+    torch.save(torch.tensor(np.array(_sp_list[:_tr_sp],
+                                     dtype=np.int64)), "train_states_self.pt")
+    torch.save(torch.tensor(np.array(_sp_list[_tr_sp:_tr_sp + _te_sp],
+                                     dtype=np.int64)), "test_states_self.pt")
+    torch.save(torch.tensor(np.array(_sp_list[_tr_sp + _te_sp:],
+                                     dtype=np.int64)), "val_states_self.pt")
+    print(f"Self-play state tensors saved: {_n_sp} total states "
+          f"(train={_tr_sp}, val={_vl_sp}, test={_te_sp}).")
+else:
+    print("Self-play state tensors already exist.")
 
 
 X_train, y_cells_train, y_turn_train = preprocess(train_states_tensor)
