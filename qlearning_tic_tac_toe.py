@@ -20,6 +20,7 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 PLOT_PATH = "./plots"
+os.makedirs(PLOT_PATH, exist_ok=True)
 
 
 
@@ -728,380 +729,213 @@ def beta_schedule(epoch, warmup_epochs=10, max_beta=0.5):
     return min(max_beta, max_beta * (epoch / warmup_epochs)) 
 
 
-# =============================================================================
-# Q1.6 – Combining Knowledge from Multiple Q-Tables
-# =============================================================================
-
-def merge_q_tables_avg(q_list: list) -> dict:
-    """
-    Merge multiple Q-tables by averaging Q-values.
-
-    For each (state, action) pair present in any of the source tables the
-    merged value is the arithmetic mean of all available estimates.  States
-    that appear in only a subset of the tables are still included; the average
-    is taken over the tables that actually contain that (state, action) pair.
-    """
-    merged: dict = {}
-    count:  dict = {}
-    for Q in q_list:
-        for state, actions in Q.items():
-            if state not in merged:
-                merged[state] = {}
-                count[state]  = {}
-            for action, value in actions.items():
-                merged[state][action] = merged[state].get(action, 0.0) + value
-                count[state][action]  = count[state].get(action, 0)   + 1
-    for state in merged:
-        for action in merged[state]:
-            merged[state][action] /= count[state][action]
-    return merged
-
-
-def merge_q_tables_max(q_list: list) -> dict:
-    """
-    Merge multiple Q-tables by taking the element-wise maximum Q-value.
-
-    Retains the most optimistic estimate seen across all training regimes for
-    each (state, action) pair.  This can be useful when one of the source
-    tables has been trained against a strong opponent and has learned high-
-    confidence values for certain positions that the others have not converged
-    on yet.
-    """
-    merged: dict = {}
-    for Q in q_list:
-        for state, actions in Q.items():
-            if state not in merged:
-                merged[state] = {}
-            for action, value in actions.items():
-                if action not in merged[state] or value > merged[state][action]:
-                    merged[state][action] = value
-    return merged
-
-
-def fine_tune_merged_q(game: TicTacToe_N_K, Q_merged: dict,
-                       fine_tune_games: int = 15000) -> dict:
-    """
-    Refine a merged Q-table via additional self-play training.
-
-    Self-play exposes the merged table to high-quality game sequences and
-    helps resolve value inconsistencies introduced by merging tables that
-    were trained against different opponent types.  The agent plays both
-    sides using the same Q-table (with a low exploration rate), so strong
-    positions from any source table are reinforced while contradictions are
-    gradually smoothed out.
-
-    For full multi-opponent rotation one could additionally call
-    play_game_q_agent and play_game_q_minimax_opponent with a low epsilon
-    on separate episode segments.  Here we use self-play only, which provides
-    the strongest opponent and most efficiently reduces sub-optimality in the
-    merged estimates.
-    """
-    global states_visited
-    states_visited = set()       # reset; fine-tuning is not used for dataset collection
-    play_game_q_self_play(game, Q_merged, games=fine_tune_games)
-    return Q_merged
-
-
 # -----------------------* -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
             # RUN A DEMO FOR OPPONENT RANDOM, AGENT LEARNING WITH Q-LEARNING UPDATE
 # -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
 
-# ------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-            # SET PARAMETERS FOR TIC TAC TOE
-n = 3
-k = 3
-train_games = 50000
-test_games = 200
-# -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-
-if "train_states.pt" not in os.listdir() or "test_states.pt" not in os.listdir() or "val_states.pt" not in os.listdir() or not os.path.exists("Q_self.pkl"):
-    game = TicTacToe_N_K(n, k)
-    states_visited = set()  # For tracking unique states visited during training
-
-    # #Play and evaluate Q-learning agent against random opponent
-    Q = {}
-    play_game_q_agent(game, Q, epsilon=1.0, games=train_games)
-    evaluate_q_agent(game, Q, games=test_games)
-
-    #Play and evaluate Q-learning agent against minimax opponent
-    Q={}
-    play_game_q_minimax_opponent(game, Q, epsilon=1.0, games=train_games)
-    evaluate_q_agent_minimax_opponent(game, Q, games=test_games)
-
-    #Play and evaluate Q-learning agent against itself (self-play)
-    Q_self = {}
-    play_game_q_self_play(game, Q_self, games=train_games)
-    evaluate_self_play_q_agent(game, Q_self, games=test_games)
-
-    print(f"Total unique states visited during training: {len(states_visited)}")
-
-    with open("Q_self.pkl", "wb") as _f:
-        pickle.dump(Q_self, _f)
-    _visited_np = np.array(list(states_visited), dtype=np.int64)
-    torch.save(torch.tensor(_visited_np, dtype=torch.int64), "visited_states_all.pt")
-    print("Q_self.pkl and visited_states_all.pt saved.")
-
-    states_visited = list(states_visited)
-        
-    random.Random(42).shuffle(states_visited)  # Shuffle the states to ensure random order
-    n = len(states_visited)
-
-    train_ratio, val_ratio, test_ratio = 0.7, 0.15, 0.15
-    train_size = int(train_ratio * n)
-    val_size = int(val_ratio * n)
-    test_size = n - train_size - val_size
-
-    #Split dataset list to train, val, test
-    train_states = states_visited[:train_size]
-    test_states = states_visited[train_size:train_size + test_size]
-    val_states = states_visited[train_size + test_size:]
-
-    train_states_visited = np.array(train_states, dtype = np.int64)
-    test_states_visited = np.array(test_states, dtype = np.int64)
-    val_states_visited = np.array(val_states, dtype = np.int64)
-
-    train_states_tensor = torch.tensor(train_states_visited, dtype=torch.int64)
-    test_states_tensor = torch.tensor(test_states_visited, dtype=torch.int64)
-    val_states_tensor = torch.tensor(val_states_visited, dtype=torch.int64)
-
-    #Save tensors for future reference
-    torch.save(train_states_tensor, "train_states.pt")
-    torch.save(test_states_tensor, "test_states.pt")
-    torch.save(val_states_tensor, "val_states.pt")
-    print("States tensor saved to train_states.pt, test_states.pt, val_states.pt")
-
-else:
-    #Load pre-existed tensors
-    train_states_tensor = torch.load("train_states.pt")
-    test_states_tensor = torch.load("test_states.pt")
-    val_states_tensor = torch.load("val_states.pt")
-    print("States tensors loaded from train_states.pt, test_states.pt, val_states.pt")
-
-
-# =============================================================================
-# Q1.6 – Train / load per-regime Q-tables and combine them
-# =============================================================================
-if not os.path.exists("Q_random.pkl") or not os.path.exists("Q_minimax.pkl"):
-    _board_n16, _board_k16 = 3, 3
-    _game16 = TicTacToe_N_K(_board_n16, _board_k16)
-    states_visited = set()
-
-    Q_random = {}
-    print("Q1.6: Training Q_random (vs random opponent) ...")
-    play_game_q_agent(_game16, Q_random, epsilon=1.0, games=train_games)
-    with open("Q_random.pkl", "wb") as _f16:
-        pickle.dump(Q_random, _f16)
-
-    Q_minimax_16 = {}
-    print("Q1.6: Training Q_minimax (vs minimax opponent) ...")
-    play_game_q_minimax_opponent(_game16, Q_minimax_16, epsilon=1.0, games=train_games)
-    with open("Q_minimax.pkl", "wb") as _f16:
-        pickle.dump(Q_minimax_16, _f16)
-
-    print("Q_random.pkl and Q_minimax.pkl saved.")
-else:
-    with open("Q_random.pkl", "rb") as _f16:
-        Q_random = pickle.load(_f16)
-    with open("Q_minimax.pkl", "rb") as _f16:
-        Q_minimax_16 = pickle.load(_f16)
-    print("Q_random.pkl and Q_minimax.pkl loaded.")
-
-with open("Q_self.pkl", "rb") as _f16:
-    Q_self_16 = pickle.load(_f16)
-
-# Q1.6b – Merge Q-tables (two strategies)
-Q_merged_avg = merge_q_tables_avg([Q_random, Q_minimax_16, Q_self_16])
-Q_merged_max = merge_q_tables_max([Q_random, Q_minimax_16, Q_self_16])
-print(f"Q1.6 Merged (avg): {len(Q_merged_avg)} states | "
-      f"Merged (max): {len(Q_merged_max)} states")
-
-# Q1.6c – Fine-tune the average-merged table via self-play
-if not os.path.exists("Q_merged_finetuned.pkl"):
-    _board_n16, _board_k16 = 3, 3
-    _game16 = TicTacToe_N_K(_board_n16, _board_k16)
-    Q_merged_finetuned = fine_tune_merged_q(_game16, copy.deepcopy(Q_merged_avg),
-                                            fine_tune_games=15000)
-    with open("Q_merged_finetuned.pkl", "wb") as _f16:
-        pickle.dump(Q_merged_finetuned, _f16)
-    print("Q_merged_finetuned.pkl saved.")
-else:
-    with open("Q_merged_finetuned.pkl", "rb") as _f16:
-        Q_merged_finetuned = pickle.load(_f16)
-    print("Q_merged_finetuned.pkl loaded.")
-
-# Evaluate all three merged variants against a random opponent
-_eval_game16 = TicTacToe_N_K(3, 3)
-print("\nQ1.6 Evaluation vs random opponent:")
-print("  Merged-Avg :")
-evaluate_q_agent(_eval_game16, Q_merged_avg, games=test_games)
-print("  Merged-Max :")
-evaluate_q_agent(_eval_game16, Q_merged_max, games=test_games)
-print("  Fine-tuned :")
-evaluate_q_agent(_eval_game16, Q_merged_finetuned, games=test_games)
-
-# =============================================================================
-# Generate self-play-only state tensors (train / val / test splits)
-# =============================================================================
-if ("train_states_self.pt"   not in os.listdir()
-        or "val_states_self.pt"   not in os.listdir()
-        or "test_states_self.pt"  not in os.listdir()
-        or "visited_states_self.pt" not in os.listdir()):
-    print("Generating self-play-only state tensors ...")
-    _board_nsp, _board_ksp = 3, 3
-    _game_sp = TicTacToe_N_K(_board_nsp, _board_ksp)
-    states_visited = set()          # reset → captures self-play states only
-    _Q_sp = {}
-    play_game_q_self_play(_game_sp, _Q_sp, games=train_games)
-
-    _visited_sp_np = np.array(list(states_visited), dtype=np.int64)
-    torch.save(torch.tensor(_visited_sp_np, dtype=torch.int64), "visited_states_self.pt")
-
-    _sp_list = list(states_visited)
-    random.Random(42).shuffle(_sp_list)
-    _n_sp  = len(_sp_list)
-    _tr_sp = int(0.70 * _n_sp)
-    _vl_sp = int(0.15 * _n_sp)
-    _te_sp = _n_sp - _tr_sp - _vl_sp
-
-    torch.save(torch.tensor(np.array(_sp_list[:_tr_sp],
-                                     dtype=np.int64)), "train_states_self.pt")
-    torch.save(torch.tensor(np.array(_sp_list[_tr_sp:_tr_sp + _te_sp],
-                                     dtype=np.int64)), "test_states_self.pt")
-    torch.save(torch.tensor(np.array(_sp_list[_tr_sp + _te_sp:],
-                                     dtype=np.int64)), "val_states_self.pt")
-    print(f"Self-play state tensors saved: {_n_sp} total states "
-          f"(train={_tr_sp}, val={_vl_sp}, test={_te_sp}).")
-else:
-    print("Self-play state tensors already exist.")
-
-
-X_train, y_cells_train, y_turn_train = preprocess(train_states_tensor)
-X_val,   y_cells_val,   y_turn_val   = preprocess(val_states_tensor)
-X_test,  y_cells_test,  y_turn_test  = preprocess(test_states_tensor)
-
-
-train_dataset = TensorDataset(X_train, y_cells_train, y_turn_train)
-val_dataset = TensorDataset(X_val, y_cells_val, y_turn_val)
-test_dataset = TensorDataset(X_test, y_cells_test, y_turn_test)
-
-#Load dataset in dataloader in order to pass data into batches.
-train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-test_dataloader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-# ------------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-            #DEFINE VAE ARCHITECTURE
-# -----------------------*-----------------------*-----------------------*-----------------------*-----------------------*-----------------------*
-
-input_dim = X_train.shape[1]
-latent_dim = 8 #will multiplied by 2
-hidden_dim = 64
-D = 9   #number of cells on the board for classic 3x3 Tic-Tac-Toe
-num_moves = 3 #empty, X, O
-
-
-#Define structure of encoder, decoder of VAE
-encoder_net = nn.Sequential(
-    nn.Linear(input_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, latent_dim * 2)
-)
-
-decoder_net = nn.Sequential(
-    nn.Linear(latent_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, hidden_dim),
-    nn.ReLU(),
-    nn.Linear(hidden_dim, D*num_moves + 1)
-)
-
-vae = VAE(encoder_net, decoder_net, D = D, L = latent_dim, num_vals=num_moves)
-
+# ---- module-level constants: always available when imported by evaluation.py ----
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# Move model to GPU if available for faster training
-vae.to(device)
-
-optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
-
-# Define number of epochs and number of warm-up epochs. The warm-up epochs are those during which beta is gradually increased from 0 to 1, allowing the model to first focus on reconstruction before regularizing with KL divergence. After warm-up, beta remains at 1 for true ELBO optimization.
-epochs = 30
-warmup_epochs = 20
-
-train_loss_list = []
-train_re_list = []
-train_kl_list = []
-epoch_list = []
-val_loss_list = []
-val_re_list = []
-val_kl_list = []
-
-best_state = None
-best_val_loss = float("inf")
-for epoch in range(epochs): #each epoch pass through the whole training dataset once
-    beta = beta_schedule(epoch, warmup_epochs, max_beta=1.0) # Linearly increase beta from 0 to max_beta over warmup_epochs, then keep it at max_beta
-    train_loss, train_re, train_kl = run_epoch(
-        train_dataloader, training=True, optimizer=optimizer, beta=beta
-    )
-
-    # evaluate with beta=1.0 (true ELBO scale)
-    val_loss, val_re, val_kl = run_epoch(val_dataloader, False, optimizer=None, beta=1.0)
-    
-
-    print(
-    f"Epoch {epoch:03d} | "
-    f"beta={beta:.2f} | "
-    f"Train: Loss={train_loss:.4f}, RE={train_re:.4f}, KL={train_kl:.4f} | "
-    f"Val (beta=1): Loss={val_loss:.4f}, RE={val_re:.4f}, KL={val_kl:.4f}"
+_L, _H, _D, _C = 8, 64, 9, 3  # latent_dim, hidden_dim, board_cells, num_classes
+encoder_net = nn.Sequential(
+    nn.Linear(28, _H), nn.ReLU(),
+    nn.Linear(_H, _H), nn.ReLU(),
+    nn.Linear(_H, _L * 2)
+)
+decoder_net = nn.Sequential(
+    nn.Linear(_L, _H), nn.ReLU(),
+    nn.Linear(_H, _H), nn.ReLU(),
+    nn.Linear(_H, _D * _C + 1)
 )
 
-    if epoch >= warmup_epochs and val_loss < best_val_loss:
-        best_val_loss = val_loss
-        best_state = copy.deepcopy(vae.state_dict()) # Save the best model state based on validation loss after warm-up epochs since val loss and train loss are decreasing and they are close.
+if __name__ == "__main__":
+    n = 3
+    k = 3
+    train_games = 50000
+    test_games = 1000
 
-    if epoch % 2 == 0:
-        train_loss_list.append(train_loss)
-        train_re_list.append(train_re)
-        train_kl_list.append(train_kl)
-        epoch_list.append(epoch)
-        val_loss_list.append(val_loss)
-        val_re_list.append(val_re)
-        val_kl_list.append(val_kl) # Store training and validation metrics every 2 epochs for plotting
+    _required = [
+        "train_states.pt", "test_states.pt", "val_states.pt",
+        "Q_self.pkl", "Q_random.pkl", "Q_minimax.pkl",
+        "Q_merged_avg.pkl", "Q_merged_max.pkl", "Q_merged_finetuned.pkl",
+    ]
+    if not all(os.path.exists(p) for p in _required):
+        game = TicTacToe_N_K(n, k)
+        states_visited = set()
 
-plt.figure()
-plt.plot(epoch_list, train_loss_list, 'bo-', label='Train Loss')
-plt.plot(epoch_list, val_loss_list, 'co-', label='Val Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.title('Total Loss Over Epochs')
-plt.legend()
-plt.savefig(PLOT_PATH + '/training_loss.png')
-plt.close()
+        # Q1.6: Train three separate Q-tables
+        Q_random = {}
+        play_game_q_agent(game, Q_random, epsilon=1.0, games=train_games)
+        evaluate_q_agent(game, Q_random, games=test_games)
 
-plt.figure()
-plt.plot(epoch_list, train_re_list, 'ro-', label='Train RE')
-plt.plot(epoch_list, val_re_list, 'mo-', label='Val RE')
-plt.xlabel('Epoch')
-plt.ylabel('Reconstruction_Error')
-plt.title('Reconstruction Error Over Epochs')
-plt.legend()
-plt.savefig(PLOT_PATH + '/training_re.png')
-plt.close()
+        Q_minimax = {}
+        play_game_q_minimax_opponent(game, Q_minimax, epsilon=1.0, games=train_games)
+        evaluate_q_agent_minimax_opponent(game, Q_minimax, games=test_games)
 
-plt.figure()
-plt.plot(epoch_list, train_kl_list, 'go-', label='Train KL')
-plt.plot(epoch_list, val_kl_list, 'yo-', label='Val KL')
-plt.xlabel('Epoch')
-plt.ylabel('KL_Divergence')
-plt.title('KL Divergence Over Epochs')
-plt.legend()
-plt.savefig(PLOT_PATH + '/training_kl.png')
-plt.close()
+        Q_self = {}
+        play_game_q_self_play(game, Q_self, games=train_games)
+        evaluate_self_play_q_agent(game, Q_self, games=test_games)
 
-if best_state is not None:
-    vae.load_state_dict(best_state)
-    torch.save(best_state, "vae_best.pt") # Save the best model state to a file for future reference
-test_loss, test_re, test_kl = run_epoch(test_dataloader, False, optimizer=None, beta=1.0) # Evaluate the best model on the test set using true ELBO scale (beta=1.0) to report final performance metrics on unseen states
-print("TEST:", test_loss, test_re, test_kl)
+        # Q1.6b: Merge by average and by max over shared state-action pairs
+        _tables = (Q_random, Q_minimax, Q_self)
+        _all_states = set(Q_random) | set(Q_minimax) | set(Q_self)
+        Q_merged_avg = {}
+        Q_merged_max = {}
+        for _s in _all_states:
+            _actions = set()
+            for _t in _tables:
+                if _s in _t:
+                    _actions |= set(_t[_s])
+            Q_merged_avg[_s] = {}
+            Q_merged_max[_s] = {}
+            for _a in _actions:
+                _vals = [_t[_s][_a] for _t in _tables if _s in _t and _a in _t[_s]]
+                Q_merged_avg[_s][_a] = sum(_vals) / len(_vals)
+                Q_merged_max[_s][_a] = max(_vals)
+
+        # Q1.6c: Evaluate merged tables, then fine-tune a copy
+        print("Merged average (before fine-tuning):")
+        evaluate_self_play_q_agent(game, Q_merged_avg, games=test_games)
+        print("Merged maximum:")
+        evaluate_self_play_q_agent(game, Q_merged_max, games=test_games)
+
+        Q_merged_finetuned = copy.deepcopy(Q_merged_avg)
+        print("Fine-tuning Q_merged_finetuned with self-play...")
+        play_game_q_self_play(game, Q_merged_finetuned, games=train_games // 5)
+        print("Merged average after fine-tuning:")
+        evaluate_self_play_q_agent(game, Q_merged_finetuned, games=test_games)
+
+        print(f"Total unique states visited during training: {len(states_visited)}")
+
+        with open("Q_self.pkl", "wb") as _f:
+            pickle.dump(Q_self, _f)
+        with open("Q_random.pkl", "wb") as _f:
+            pickle.dump(Q_random, _f)
+        with open("Q_minimax.pkl", "wb") as _f:
+            pickle.dump(Q_minimax, _f)
+        with open("Q_merged_avg.pkl", "wb") as _f:
+            pickle.dump(Q_merged_avg, _f)
+        with open("Q_merged_max.pkl", "wb") as _f:
+            pickle.dump(Q_merged_max, _f)
+        with open("Q_merged_finetuned.pkl", "wb") as _f:
+            pickle.dump(Q_merged_finetuned, _f)
+        _visited_np = np.array(list(states_visited), dtype=np.int64)
+        torch.save(torch.tensor(_visited_np, dtype=torch.int64), "visited_states_all.pt")
+        print("Q tables and visited_states_all.pt saved.")
+
+        states_visited = list(states_visited)
+        random.Random(42).shuffle(states_visited)
+        n = len(states_visited)
+
+        train_ratio, val_ratio, test_ratio = 0.7, 0.15, 0.15
+        train_size = int(train_ratio * n)
+        val_size = int(val_ratio * n)
+        test_size = n - train_size - val_size
+
+        train_states = states_visited[:train_size]
+        test_states = states_visited[train_size:train_size + test_size]
+        val_states = states_visited[train_size + test_size:]
+
+        train_states_visited = np.array(train_states, dtype=np.int64)
+        test_states_visited = np.array(test_states, dtype=np.int64)
+        val_states_visited = np.array(val_states, dtype=np.int64)
+
+        train_states_tensor = torch.tensor(train_states_visited, dtype=torch.int64)
+        test_states_tensor = torch.tensor(test_states_visited, dtype=torch.int64)
+        val_states_tensor = torch.tensor(val_states_visited, dtype=torch.int64)
+
+        torch.save(train_states_tensor, "train_states.pt")
+        torch.save(test_states_tensor, "test_states.pt")
+        torch.save(val_states_tensor, "val_states.pt")
+        print("States tensor saved to train_states.pt, test_states.pt, val_states.pt")
+
+    else:
+        train_states_tensor = torch.load("train_states.pt")
+        test_states_tensor = torch.load("test_states.pt")
+        val_states_tensor = torch.load("val_states.pt")
+        print("States tensors loaded from train_states.pt, test_states.pt, val_states.pt")
+
+    X_train, y_cells_train, y_turn_train = preprocess(train_states_tensor)
+    X_val,   y_cells_val,   y_turn_val   = preprocess(val_states_tensor)
+    X_test,  y_cells_test,  y_turn_test  = preprocess(test_states_tensor)
+
+    train_dataset = TensorDataset(X_train, y_cells_train, y_turn_train)
+    val_dataset   = TensorDataset(X_val,   y_cells_val,   y_turn_val)
+    test_dataset  = TensorDataset(X_test,  y_cells_test,  y_turn_test)
+
+    train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_dataloader   = DataLoader(val_dataset,   batch_size=64, shuffle=False)
+    test_dataloader  = DataLoader(test_dataset,  batch_size=64, shuffle=False)
+
+    latent_dim = 8
+    hidden_dim = 64
+    D = 9
+    num_moves = 3
+
+    vae = VAE(encoder_net, decoder_net, D=D, L=latent_dim, num_vals=num_moves)
+    vae.to(device)
+    optimizer = torch.optim.Adam(vae.parameters(), lr=1e-3)
+
+    epochs = 30
+    warmup_epochs = 20
+
+    train_loss_list = []
+    train_re_list = []
+    train_kl_list = []
+    epoch_list = []
+    val_loss_list = []
+    val_re_list = []
+    val_kl_list = []
+
+    best_state = None
+    best_val_loss = float("inf")
+    for epoch in range(epochs):
+        beta = beta_schedule(epoch, warmup_epochs, max_beta=1.0)
+        train_loss, train_re, train_kl = run_epoch(
+            train_dataloader, training=True, optimizer=optimizer, beta=beta
+        )
+        val_loss, val_re, val_kl = run_epoch(val_dataloader, False, optimizer=None, beta=1.0)
+
+        print(
+            f"Epoch {epoch:03d} | "
+            f"beta={beta:.2f} | "
+            f"Train: Loss={train_loss:.4f}, RE={train_re:.4f}, KL={train_kl:.4f} | "
+            f"Val (beta=1): Loss={val_loss:.4f}, RE={val_re:.4f}, KL={val_kl:.4f}"
+        )
+
+        if epoch >= warmup_epochs and val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(vae.state_dict())
+
+        if epoch % 2 == 0:
+            train_loss_list.append(train_loss)
+            train_re_list.append(train_re)
+            train_kl_list.append(train_kl)
+            epoch_list.append(epoch)
+            val_loss_list.append(val_loss)
+            val_re_list.append(val_re)
+            val_kl_list.append(val_kl)
+
+    plt.figure()
+    plt.plot(epoch_list, train_loss_list, 'bo-', label='Train Loss')
+    plt.plot(epoch_list, val_loss_list, 'co-', label='Val Loss')
+    plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.title('Total Loss Over Epochs')
+    plt.legend(); plt.savefig(PLOT_PATH + '/training_loss.png'); plt.close()
+
+    plt.figure()
+    plt.plot(epoch_list, train_re_list, 'ro-', label='Train RE')
+    plt.plot(epoch_list, val_re_list, 'mo-', label='Val RE')
+    plt.xlabel('Epoch'); plt.ylabel('Reconstruction_Error'); plt.title('Reconstruction Error Over Epochs')
+    plt.legend(); plt.savefig(PLOT_PATH + '/training_re.png'); plt.close()
+
+    plt.figure()
+    plt.plot(epoch_list, train_kl_list, 'go-', label='Train KL')
+    plt.plot(epoch_list, val_kl_list, 'yo-', label='Val KL')
+    plt.xlabel('Epoch'); plt.ylabel('KL_Divergence'); plt.title('KL Divergence Over Epochs')
+    plt.legend(); plt.savefig(PLOT_PATH + '/training_kl.png'); plt.close()
+
+    if best_state is not None:
+        vae.load_state_dict(best_state)
+        torch.save(best_state, "vae_best.pt")
+    test_loss, test_re, test_kl = run_epoch(test_dataloader, False, optimizer=None, beta=1.0)
+    print("TEST:", test_loss, test_re, test_kl)
 

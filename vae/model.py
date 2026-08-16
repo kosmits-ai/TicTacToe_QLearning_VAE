@@ -78,38 +78,26 @@ class Decoder(nn.Module):
         
         return board_sampled, turn_sampled
 
-    #Calculates log p(x|z), the log-likelihood of the true board configuration x under the decoder distribution p(x|z). This is used in the reconstruction error term of the ELBO.
     def log_prob(self, x_idx,turn, z):
-        # # x: (B, D) pixel values (float but representing integers 0..255)
-        # # probs: (B, D, V)
+      
         
         board_logits, turn_logit = self.decode(z)
-        weight_turn = 3.0 #weight for turn prediction in the loss, can be tuned as a hyperparameter
-        # # log prob per pixel after summing over classes -> (B, D)
+        weight_turn = 1.0 
         log_px_board = log_categorical_indices(x_idx, board_logits)
         
         turn_0_1 = turn.float()
-        # log p(turn | z) for Bernoulli with logits:
-        # BCEWithLogits gives -log likelihood, so negate it
+   
         bce = nn.functional.binary_cross_entropy_with_logits(turn_logit, turn_0_1, reduction="none")  # (B,1)
         log_px_turn = -weight_turn*bce.squeeze(-1)  # (B,)
 
-        # joint log-likelihood
+     
         return log_px_board + log_px_turn
         
 
 
 
 class Prior(nn.Module):
-    # -------------------------------------------------------------------------
-    # Standard Normal prior p(z)=N(0,I)
-    #
-    # sample:
-    # - returns z: (B, L) on the requested device
-    #
-    # log_prob:
-    # - returns elementwise log p(z): (B, L)
-    # -------------------------------------------------------------------------
+    
 
     def __init__(self, L):
         super().__init__()
@@ -127,17 +115,7 @@ class Prior(nn.Module):
 
 
 class VAE(nn.Module):
-    # -------------------------------------------------------------------------
-    # Full VAE:
-    # - Encoder: q(z|x)
-    # - Decoder: p(x|z)
-    # - Prior: p(z)
-    #
-    # forward(x) returns negative ELBO:
-    # - RE: (B,) = log p(x|z)
-    # - KL: (B,) = sum_i [log p(z_i) - log q(z_i|x)]
-    # - loss: scalar mean or sum over batch
-    # -------------------------------------------------------------------------
+   
 
     def __init__(self, encoder_net, decoder_net, D, L, num_vals=3):
         super().__init__()
@@ -153,23 +131,21 @@ class VAE(nn.Module):
     
     def forward(self, x_enc,y_cells, y_turn, beta, reduction="avg"):
         
-        mu_e, log_var_e = self.encoder.encode(x_enc)  # # (B, L), (B, L)
+        mu_e, log_var_e = self.encoder.encode(x_enc)  
+        z = self.encoder.sample(mu_e=mu_e, log_var_e=log_var_e)  
 
-        # # Sample z
-        z = self.encoder.sample(mu_e=mu_e, log_var_e=log_var_e)  # # (B, L)
-
-        log_px = self.decoder.log_prob(y_cells, y_turn, z)  # # (B,)
-        log_pz = self.prior.log_prob(z).sum(-1)  # # (B,)
-        log_qz = self.encoder.log_prob(mu_e=mu_e, log_var_e=log_var_e, z=z).sum(-1)  # # (B,)
+        log_px = self.decoder.log_prob(y_cells, y_turn, z) 
+        log_pz = self.prior.log_prob(z).sum(-1)
+        log_qz = self.encoder.log_prob(mu_e=mu_e, log_var_e=log_var_e, z=z).sum(-1)  
         
         re = (-log_px)
         kl = (log_qz - log_pz)
 
         elbo = re + beta * kl
         if reduction == "avg":
-            return elbo.mean(), re.mean() , kl.mean()  # return mean loss 
+            return elbo.mean(), re.mean() , kl.mean()  
         else:
-            return elbo.sum(), re.sum(), kl.sum()  # return total loss 
+            return elbo.sum(), re.sum(), kl.sum()  
 
         
     @torch.no_grad()
@@ -179,7 +155,7 @@ class VAE(nn.Module):
             device = next(self.parameters()).device
 
         # # sample z on device
-        z = self.prior.sample(batch_size, device=device)  # # (B, L)
+        z = self.prior.sample(batch_size, device=device, seed=42)  # # (B, L)
 
         # # sample x on device (returns integer-valued tensor)
         x_new, turn_new = self.decoder.sample(z)  # # (B, D)
